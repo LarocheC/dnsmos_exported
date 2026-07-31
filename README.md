@@ -85,6 +85,15 @@ joint-graph export to ONNX has unresolved gaps). Verified against
   produced by `qdq_writer.write_qdq_from_sim`, which stamps the QAT sim's own
   quantization grids into the graph instead of re-calibrating, so the deployed
   artifact inherits the sim's measured deltas exactly.
+- *Float tail*: the dense head (+ the a7 activation) stays float — it is
+  ~0.4% of the MACs but gates the heavy-tailed SIG error through the global
+  max. Pass `--full-int8` to `scripts/export_int8.py` to quantize it anyway.
+
+Measured deltas vs the fp32 reference (100 synthetic segments): mean |ΔMOS|
+0.037 / 0.016 / 0.017 and p95 0.145 / 0.054 / 0.061 for SIG / BAK / OVRL.
+Gates: mean < 0.05 everywhere; p95 < 0.10 for BAK/OVRL, < 0.18 for SIG
+(intrinsically the noisiest output under int8 — its error enters through the
+global-max routing, which propagates worst-case quantization noise).
 
 **Int8 gradient reality.** An int8-quantized forward is a different (staircase)
 function from the fp32 model; even PyTorch's own straight-through-estimator
@@ -93,7 +102,7 @@ Demanding near-1.0 cosine from an int8 loss graph is physically meaningless, so
 the gates are:
 
 - **Functional (hard):** optimizing a waveform with int8 gradients for 60 steps
-  must raise the fp32-reference OVRL by ≥ +0.3. (Current artifact: **+1.40**,
+  must raise the fp32-reference OVRL by ≥ +0.3. (Current artifact: **+1.61**,
   vs ≈ +2.3 with fp32 gradients.)
 - **Cosine tripwire (hard):** mean cosine ≥ 0.4 vs fp32 gradients.
 

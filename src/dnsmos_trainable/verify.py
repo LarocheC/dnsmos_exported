@@ -170,14 +170,20 @@ def finite_diff_check(
     return np.array(rel_errs)
 
 
-def int8_delta_report(fp32_path: str | Path, int8_path: str | Path, batch: np.ndarray) -> dict:
-    """MOS deltas between fp32 and int8 forward artifacts."""
+def int8_delta_report(
+    fp32_path: str | Path, int8_path: str | Path, batch: np.ndarray, chunk: int = 8
+) -> dict:
+    """MOS deltas between fp32 and int8 forward artifacts (chunked: conv1
+    activations are ~74 MB/segment, so large batches OOM in one session run)."""
     s32, s8 = ort_session(fp32_path), ort_session(int8_path)
     name32 = s32.get_inputs()[0].name
     name8 = s8.get_inputs()[0].name
-    mos32 = s32.run(None, {name32: batch})[1]
-    mos8 = s8.run(None, {name8: batch})[1]
-    d = np.abs(mos32 - mos8)
+    mos32, mos8 = [], []
+    for i in range(0, batch.shape[0], chunk):
+        part = batch[i : i + chunk]
+        mos32.append(s32.run(None, {name32: part})[1])
+        mos8.append(s8.run(None, {name8: part})[1])
+    d = np.abs(np.concatenate(mos32) - np.concatenate(mos8))
     return {
         "mean": d.mean(axis=0).tolist(),
         "p95": np.percentile(d, 95, axis=0).tolist(),

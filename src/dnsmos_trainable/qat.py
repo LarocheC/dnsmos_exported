@@ -83,10 +83,14 @@ def calibrate_act_ranges(
     ranges = {}
     for site, chunks in samples.items():
         allv = torch.cat(chunks)
-        ranges[site] = (
-            float(torch.quantile(allv, lo_q)),
-            float(torch.quantile(allv, hi_q)),
-        )
+        if percentile >= 100.0:
+            ranges[site] = (float(allv.min()), float(allv.max()))
+        else:
+            # torch.quantile caps input size; sort-based quantile instead.
+            v, _ = allv.sort()
+            lo = v[int(lo_q * (v.numel() - 1))]
+            hi = v[int(hi_q * (v.numel() - 1))]
+            ranges[site] = (float(lo), float(hi))
     return ranges
 
 
