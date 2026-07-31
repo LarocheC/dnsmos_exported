@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "dnsmos-trainable"
@@ -24,8 +24,8 @@ dependencies = [
 dev = ["pytest>=8", "pytest-xdist>=3"]
 qat = ["torchao"]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/dnsmos_trainable"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
