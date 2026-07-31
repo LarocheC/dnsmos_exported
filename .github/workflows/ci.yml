@@ -18,7 +18,7 @@ jobs:
       - name: Install (CPU torch)
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e .[dev] onnxsim
+          pip install -e .[dev]
       - name: Tests (fast)
         run: pytest -m "not slow" -q
 
@@ -34,7 +34,7 @@ jobs:
       - name: Install (CPU torch)
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e . onnxsim
+          pip install -e .
       - name: Build fp32 artifacts
         run: |
           python scripts/download_official.py
@@ -42,7 +42,12 @@ jobs:
           python scripts/export_all_fp32.py
       - name: Build int8 artifacts (PTQ fallback; QAT runs offline)
         run: |
-          python scripts/export_int8.py || echo "::warning::int8 fwd gates need QAT weights"
+          # Without the offline QAT weights the transplant-only int8 forward
+          # misses its SIG gate: keep CI green but never upload failing files.
+          python scripts/export_int8.py || {
+            echo "::warning::int8 fwd gates need QAT weights; dropping artifacts"
+            rm -f artifacts/dnsmos_fwd_int8_qdq*.onnx
+          }
           python scripts/export_int8_loss.py
       - name: Demo (PyTorch-free loop)
         run: python examples/ondevice_demo.py --steps 80

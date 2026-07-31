@@ -52,20 +52,40 @@ class _QdqBuilder:
         return name
 
     def qdq_activation(self, tensor: str, scale: float, zp: int) -> None:
-        """Insert tensor -> Q -> DQ and rewire all consumers to the DQ output."""
+        """Insert tensor -> Q -> DQ and rewire all consumers to the DQ output.
+
+        If `tensor` is a graph output, the producer is renamed and the DQ
+        output takes the original name, so the graph output carries the
+        quantized value (matching the sim, which returns the fake-quantized
+        tensor) instead of silently bypassing the Q/DQ pair.
+        """
+        graph_out = {o.name for o in self.graph.output}
+        src = tensor
+        if tensor in graph_out:
+            src = f"{tensor}_prequant"
+            producer = self.graph.node[self.by_output[tensor]]
+            for j, out in enumerate(producer.output):
+                if out == tensor:
+                    producer.output[j] = src
+            self.by_output[src] = self.by_output.pop(tensor)
         s = self.add_init(self.fresh(f"{tensor}_scale"), np.float32(scale))
         z = self.add_init(self.fresh(f"{tensor}_zp"), np.int8(zp))
-        qname, dqname = self.fresh(f"{tensor}_q"), self.fresh(f"{tensor}_dq")
-        qnode = helper.make_node("QuantizeLinear", [tensor, s, z], [qname], name=qname)
-        dqnode = helper.make_node("DequantizeLinear", [qname, s, z], [dqname], name=dqname)
+        qname = self.fresh(f"{tensor}_q")
+        dqname = tensor if tensor in graph_out else self.fresh(f"{tensor}_dq")
+        qnode = helper.make_node("QuantizeLinear", [src, s, z], [qname], name=qname)
+        dqnode = helper.make_node(
+            "DequantizeLinear", [qname, s, z], [dqname], name=self.fresh(f"{tensor}_dq")
+        )
         for node in self.graph.node:
             if node.op_type in ("QuantizeLinear",):
                 continue
             for j, inp in enumerate(node.input):
-                if inp == tensor and node is not qnode:
+                if inp == src and node is not qnode:
                     node.input[j] = dqname
-        idx = self.by_output[tensor]
+        idx = self.by_output[src]
         self.inserts.setdefault(idx, []).extend([qnode, dqnode])
+        if dqname != tensor:
+            self.by_output[dqname] = idx
 
     def dq_weight(self, node: onnx.NodeProto, w_name: str, w: np.ndarray) -> np.ndarray:
         q, scales = _weight_qparams(w)

@@ -1,9 +1,10 @@
 """Featurizer mirroring the official sig_bak_ovr.onnx graph op-for-op.
 
 The official graph frames the raw waveform with two 160-sample-offset slices,
-projects each 320-sample frame through *trained* real/imag matrices (these are
-NOT a DFT — they were trained end-to-end and must be transplanted verbatim),
-and takes a log10 power spectrogram.
+projects each 320-sample frame through *trained* real/imag matrices (close to
+a hann-windowed DFT — per-bin cosine 0.93-0.98 — but trained end-to-end, so
+exact parity requires transplanting them verbatim), and takes a log10 power
+spectrogram.
 
 The official chain is sqrt(re^2+im^2) -> Pow(2) -> Max(eps) -> Log -> Div(ln10).
 sqrt followed by squaring cancels, so we compute log10(clamp(re^2+im^2, eps))

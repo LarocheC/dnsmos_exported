@@ -68,10 +68,51 @@ def test_tie_policy(transplanted):
     lg_dev = DnsmosLossGraph(transplanted, mode="device")
     with torch.no_grad():
         _, _, grad_dev = lg_dev(wav, w)
-    # Documented policy: device mode overcounts exact ties; it must be finite
-    # and agree in sign/scale, but not necessarily equal on this adversarial
-    # tie-saturated input.
+    # Documented policy: device mode splits ties evenly (global max and
+    # max-pool); on this tie-saturated input it need not equal autograd's
+    # first-index max-pool routing, but must stay finite.
     assert torch.isfinite(grad_dev).all()
+
+
+def test_maxpool_bwd_device_tie_splitting():
+    """Direct gate on the even tie split (essential for int8 forwards)."""
+    from dnsmos_trainable.backward import maxpool2d_bwd_device
+
+    # One 2x2 window with a 3-way tie, one with a unique max; odd extra col.
+    x = torch.tensor([[[[2.0, 2.0, 9.0],
+                        [2.0, 1.0, 9.0]]]])
+    y = torch.nn.functional.max_pool2d(x, 2, 2)  # -> [[[[2.0]]]]
+    g_y = torch.tensor([[[[3.0]]]])
+    g_x = maxpool2d_bwd_device(g_y, x, y)
+    expect = torch.tensor([[[[1.0, 1.0, 0.0],
+                             [1.0, 0.0, 0.0]]]])
+    assert torch.allclose(g_x, expect), g_x
+    # Gradient mass conserved; padded (uncovered) column got nothing.
+    assert g_x.sum() == g_y.sum()
+
+    # Tie-free window must match autograd exactly.
+    torch.manual_seed(3)
+    x2 = torch.randn(1, 2, 6, 6, requires_grad=True)
+    y2 = torch.nn.functional.max_pool2d(x2, 2, 2)
+    g = torch.randn_like(y2)
+    (ref,) = torch.autograd.grad(y2, x2, g)
+    ours = maxpool2d_bwd_device(g, x2.detach(), y2.detach())
+    assert torch.allclose(ours, ref, atol=1e-7)
+
+
+def test_global_maxpool_bwd_tie_splitting():
+    from dnsmos_trainable.backward import global_maxpool_bwd
+
+    x = torch.tensor([[[[5.0, 5.0], [1.0, 5.0]],   # channel 0: 3-way tie
+                       [[7.0, 0.0], [0.0, 0.0]]]])  # channel 1: unique max
+    y = torch.amax(x, dim=(2, 3))
+    g_y = torch.tensor([[6.0, 2.0]])
+    for mode in ("device", "ort"):
+        g_x = global_maxpool_bwd(g_y, x, y, mode)
+        expect = torch.tensor([[[[2.0, 2.0], [0.0, 2.0]],
+                                [[2.0, 0.0], [0.0, 0.0]]]])
+        assert torch.allclose(g_x, expect), (mode, g_x)
+        assert torch.allclose(g_x.sum(dim=(2, 3)), g_y)
 
 
 def test_grad_magnitude_sane(transplanted):

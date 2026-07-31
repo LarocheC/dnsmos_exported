@@ -63,7 +63,14 @@ def export_forward(model: DnsmosModel, out_path: str | Path, device: bool = Fals
 
         def forward(self, wav: torch.Tensor):
             if self.rows:
-                wav = wav.reshape(1, INPUT_LEN)
+                # Build frames directly from the [1, 901, 160] rows layout —
+                # never materialize a flat [1, 144160] tensor: the ST front
+                # end rejects ANY tensor dim >= 65536, interior ones included.
+                frames = torch.cat([wav[:, :-1, :], wav[:, 1:, :]], dim=2)
+                re, im = self.m.frontend.stft(frames)
+                feat = self.m.frontend.logpower(re, im).unsqueeze(1)
+                raw = self.m.body(feat)
+                return raw, self.m.poly(raw)
             return self.m(wav)
 
     if device:
@@ -92,9 +99,19 @@ def export_forward(model: DnsmosModel, out_path: str | Path, device: bool = Fals
             dynamic_shapes={"wav": {0: torch.export.Dim("batch", min=1, max=4096)}},
         )
     _postprocess(out_path, simplify=device)
+    if device:
+        _lint_device(out_path)
     feeds = {"wav": np.zeros(example.shape, dtype=np.float32)}
     _check_and_smoke(out_path, feeds)
     return out_path
+
+
+def _lint_device(path: Path) -> None:
+    from dnsmos_trainable.verify import check_device_constraints
+
+    problems = check_device_constraints(path)
+    if problems:
+        raise RuntimeError(f"device constraint violations in {path.name}: {problems}")
 
 
 def export_loss_graph(loss: DnsmosLossGraph, out_path: str | Path) -> Path:
@@ -131,6 +148,8 @@ def export_loss_graph(loss: DnsmosLossGraph, out_path: str | Path) -> Path:
             },
         )
     _postprocess(out_path, simplify=loss.io_layout == "rows")
+    if loss.io_layout == "rows":
+        _lint_device(out_path)
     feeds = {
         "wav": np.zeros(example.shape, dtype=np.float32),
         "w": np.array([0.0, 0.0, -1.0], dtype=np.float32),

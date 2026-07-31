@@ -19,7 +19,7 @@ from dnsmos_trainable.model import PolyMapping
 class StudentSmallBody(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 16, 3, stride=2, padding=1)  # (900,161)->(450,81)
+        self.conv1 = nn.Conv2d(1, 16, 3, stride=2, padding=1)  # (900,161)->(450,81); pools floor odd dims after
         self.conv2 = nn.Conv2d(16, 24, 3, padding=1)
         self.conv3 = nn.Conv2d(24, 32, 3, padding=1)
         self.conv4 = nn.Conv2d(32, 32, 3, padding=1)
@@ -38,7 +38,7 @@ class StudentSmallBody(nn.Module):
 
 
 class StudentSmall(nn.Module):
-    """Same (raw, mos) interface as DnsmosModel; ~30k body parameters."""
+    """Same (raw, mos) interface as DnsmosModel; ~21k body parameters."""
 
     def __init__(self, freeze_frontend: bool = True) -> None:
         super().__init__()

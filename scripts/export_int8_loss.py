@@ -62,9 +62,15 @@ def backward_conv_names(pre_path: Path) -> list[str]:
 
 
 def functional_gate(int8_loss_path: Path, fp32_fwd_path: Path, steps: int = 60) -> float:
-    """OVRL improvement (per fp32 reference) from optimizing with int8 grads."""
+    """OVRL improvement (per fp32 reference) from optimizing with int8 grads.
+
+    Adapts to the loss artifact's layout (flat [1,144160] or rows [1,901,160])
+    so the STM32N6 artifact is gated with the same procedure as the desktop one.
+    """
     sess_g = ort_session(int8_loss_path)
     sess_ref = ort_session(fp32_fwd_path)
+    # Symbolic dims (dynamic batch) come back as strings; we optimize B=1.
+    g_shape = tuple(d if isinstance(d, int) else 1 for d in sess_g.get_inputs()[0].shape)
     wav0 = make_synthetic_batch(1, seed=7)
     x = wav0.copy().astype(np.float64)
     m, v, lr, b1, b2 = 0.0, 0.0, 3e-4, 0.9, 0.999
@@ -74,7 +80,8 @@ def functional_gate(int8_loss_path: Path, fp32_fwd_path: Path, steps: int = 60) 
 
     start = ref_ovrl(x)
     for t in range(1, steps + 1):
-        g = sess_g.run(None, {"wav": x.astype(np.float32), "w": W})[2].astype(np.float64)
+        feed = x.astype(np.float32).reshape(g_shape)
+        g = sess_g.run(None, {"wav": feed, "w": W})[2].astype(np.float64).reshape(x.shape)
         m = b1 * m + (1 - b1) * g
         v = b2 * v + (1 - b2) * g * g
         x = x - lr * (m / (1 - b1**t)) / (np.sqrt(v / (1 - b2**t)) + 1e-8)
@@ -141,12 +148,28 @@ if __name__ == "__main__":
     if final is None:
         raise SystemExit("int8 loss gates FAILED at every ladder stage")
 
+    # The device artifact is a separate quantization run (own calibration,
+    # own QDQ placement, own mask repair) — walk its own exclusion ladder and
+    # gate its gradients independently of the desktop artifact.
     bwd_rows = backward_conv_names(pre_rows)
-    out_dev = quantize_qdq(
-        pre_rows, art / "dnsmos_loss_int8_qdq_stm32n6.onnx", calib_rows,
-        extra_exclude=bwd_rows[: len(final)], preprocessed=True,
-    )
-    problems = check_device_constraints(out_dev)
-    if problems:
-        raise SystemExit(f"device constraint violations: {problems}")
+    dev_ok = False
+    for depth in sorted({len(final), len(final) + 1, 2, 4, 7}):
+        if depth > 7:
+            break
+        out_dev = quantize_qdq(
+            pre_rows, art / "dnsmos_loss_int8_qdq_stm32n6.onnx", calib_rows,
+            extra_exclude=bwd_rows[:depth], preprocessed=True,
+        )
+        problems = check_device_constraints(out_dev)
+        if problems:
+            raise SystemExit(f"device constraint violations: {problems}")
+        rep_dev = int8_grad_report(art / "dnsmos_loss_fp32_stm32n6.onnx", out_dev, evalb, W)
+        gain_dev = functional_gate(out_dev, art / "dnsmos_fwd_fp32.onnx")
+        print(f"stm32n6[exclude={depth}] -> cosine_mean={rep_dev['cosine_mean']:.3f} "
+              f"cosine_min={rep_dev['cosine_min']:.3f} functional dOVRL={gain_dev:+.3f}")
+        if gain_dev >= 0.3 and rep_dev["cosine_mean"] >= 0.4:
+            dev_ok = True
+            break
+    if not dev_ok:
+        raise SystemExit("stm32n6 int8 loss gates FAILED at every ladder depth")
     print(f"device int8 loss artifact ok: {out_dev}")

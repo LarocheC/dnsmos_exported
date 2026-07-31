@@ -43,6 +43,8 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument("--no-gate", action="store_true",
+                        help="skip the small-student quality gate (smoke runs)")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -109,8 +111,17 @@ def main() -> None:
         print(f"epoch {epoch}: train {tot/n:.4f} val {val_mse:.4f} r_ovr {r_ovr:.3f}")
         if val_mse < best:
             best = val_mse
+            best_r_ovr = r_ovr
             torch.save(student.state_dict(), out_dir / f"distill_{args.student}_best.pt")
     print(f"best val MSE {best:.4f}")
+    if args.student == "small" and not args.no_gate:
+        # Quality gate before the student is considered exportable.
+        if best_r_ovr < 0.9:
+            raise SystemExit(
+                f"student gate FAILED: best-epoch Pearson r(OVRL) {best_r_ovr:.3f} < 0.9 "
+                "vs teacher — train longer / on more data, or pass --no-gate for smoke runs"
+            )
+        print(f"student gate PASS: r_ovr {best_r_ovr:.3f} >= 0.9")
 
 
 if __name__ == "__main__":

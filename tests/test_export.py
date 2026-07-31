@@ -89,17 +89,15 @@ FORBIDDEN_DEVICE_OPS = {
 
 @pytest.mark.parametrize("key", ["fwd_dev", "loss_dev"])
 def test_device_artifact_constraints(artifacts, key):
+    from dnsmos_trainable.verify import check_device_constraints
+
+    # The canonical lint: opset <= 13, ST Neural-ART op allowlist, static
+    # shapes, batch 1, and EVERY tensor dim < 65536 (interior included).
+    problems = check_device_constraints(artifacts[key])
+    assert not problems, problems
+    # Readable second line of defense: none of the known-bad ops.
     model = onnx.load(str(artifacts[key]))
     opset = {o.domain: o.version for o in model.opset_import}[""]
     assert opset == 13
     ops = {n.op_type for n in model.graph.node}
     assert not (ops & FORBIDDEN_DEVICE_OPS), ops & FORBIDDEN_DEVICE_OPS
-    # Every I/O dim static and < 65536 (ST front-end constraint).
-    for vi in list(model.graph.input) + list(model.graph.output):
-        dims = [d.dim_value for d in vi.type.tensor_type.shape.dim]
-        assert all(0 < d < 65536 for d in dims), (vi.name, dims)
-    # Batch is 1 on every rank>1 tensor (w is a rank-1 [3] weight vector).
-    for vi in list(model.graph.input) + list(model.graph.output):
-        dims = vi.type.tensor_type.shape.dim
-        if len(dims) > 1:
-            assert dims[0].dim_value == 1, vi.name

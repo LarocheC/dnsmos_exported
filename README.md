@@ -21,7 +21,8 @@ use with **stock ONNX Runtime** or the **STM32N6** (Neural-ART NPU via ST Edge A
 | `dnsmos_fwd_fp32_stm32n6.onnx` | `wav [1,901,160]` → `raw`, `mos` | device forward (opset 13, static shapes) |
 | `dnsmos_fwd_int8_qdq_stm32n6.onnx` | same | device int8 metric (Neural-ART fast path) |
 | `dnsmos_loss_fp32_stm32n6.onnx` | `wav [1,901,160]`, `w [3]` → `raw`, `mos`, `grad_wav [1,901,160]` | device loss graph, float |
-| `dnsmos_loss_int8_qdq.onnx` / `_stm32n6.onnx` | same | int8 loss graph (quantized forward *and* backward) |
+| `dnsmos_loss_int8_qdq.onnx` | flat I/O, as `dnsmos_loss_fp32.onnx` | int8 loss graph (quantized forward *and* backward), desktop |
+| `dnsmos_loss_int8_qdq_stm32n6.onnx` | rows I/O, as `dnsmos_loss_fp32_stm32n6.onnx` | int8 loss graph, device |
 
 - `wav`: 16 kHz float32, 9.01 s (144160 samples). The STM32N6 layout is
   `[1, 901, 160]` — one row per 10 ms hop (`wav.reshape(1, 901, 160)`) — because
@@ -54,10 +55,12 @@ SI-SNR stays ≈ 29 dB, then reports the int8 "deployed" score.
 
 **Exact transplant, not retraining.** The official `sig_bak_ovr.onnx` embeds its
 featurization in the graph, and its `stft-real`/`stft-imag` kernels are
-*trained* matrices, not a DFT (cosine similarity to an ideal DFT basis is only
-0.78–0.89) — so the weights are ported verbatim. Parity gate: in float64 the
-port matches the official model to 5.8e-6, which is ORT's own fp32 rounding;
-the framing is bit-exact. A distillation harness (`scripts/train_distill.py`,
+*trained* matrices: close to — but not exactly — a hann-windowed DFT
+(per-bin cosine similarity 0.93–0.98 on mid-band bins; they look
+DFT-initialized and mildly trained end-to-end). Exact parity requires the
+verbatim weights, so they are ported as-is, never re-derived. Parity gate: in
+float64 the port matches the official model to 5.8e-6, which is ORT's own
+fp32 rounding; the framing is bit-exact. A distillation harness (`scripts/train_distill.py`,
 teacher = official ONNX) exists for fine-tuning, architecture changes, and the
 compact student — the transplant itself needs no training.
 
@@ -116,16 +119,21 @@ runs as software epochs on the Cortex-M55 (Helium), slower but exact.
   float ops (all of them: the log frontend is float by design — one contiguous
   software epoch). Use `--mapping-recap` to inspect NPU/CPU placement and
   `--no-outputs-allocation` to place the 564 KB gradient buffer yourself.
-- Every device artifact is linted by `verify.check_device_constraints`:
-  opset 13, static shapes, batch 1, all dims < 65536, and an op vocabulary
-  restricted to the documented ST Neural-ART mapping table.
+- Every device artifact is linted by `verify.check_device_constraints` at
+  export time (the fp32 exports lint inside `export_forward`/
+  `export_loss_graph`; the int8 scripts lint their outputs): opset ≤ 13,
+  static shapes, batch 1, **all** tensor dims < 65536 (interior tensors
+  included, via shape inference), and an op vocabulary restricted to the
+  documented ST Neural-ART mapping table.
 - Memory: the full-size loss graph peaks ≈ 18.5 MB of int8 activations →
   external PSRAM territory (STM32N6570-DK: 32 MB hexa-SPI PSRAM; the Nucleo
   board has **no** external RAM). For internal-SRAM-only deployment, distill
-  the compact student (`configs/student_small.py`, ≈ 30k body parameters,
+  the compact student (`configs/student_small.py`, ≈ 21k body parameters,
   first-conv stride 2 → ≈ 0.6 MB peak activations):
   `python scripts/train_distill.py --student small --train-list ... --val-list ...`
-  (gate: Pearson r ≥ 0.9 vs teacher OVRL before exporting it).
+  — the script enforces the quality gate (best-epoch Pearson r ≥ 0.9 vs
+  teacher OVRL; `--no-gate` for smoke runs) before the student is considered
+  exportable.
 
 ## Caveats
 

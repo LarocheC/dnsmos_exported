@@ -170,20 +170,30 @@ def finite_diff_check(
     return np.array(rel_errs)
 
 
+def _fwd_mos(sess, batch: np.ndarray, chunk: int) -> np.ndarray:
+    """Run a forward artifact over flat [N, 144160] segments, adapting the
+    feed to the artifact's I/O layout (flat batched or device rows B=1)."""
+    inp = sess.get_inputs()[0]
+    rows = len(inp.shape) == 3
+    out = []
+    if rows:
+        for i in range(batch.shape[0]):
+            feed = batch[i].reshape(1, inp.shape[1], inp.shape[2])
+            out.append(sess.run(None, {inp.name: feed})[1])
+    else:
+        for i in range(0, batch.shape[0], chunk):
+            out.append(sess.run(None, {inp.name: batch[i : i + chunk]})[1])
+    return np.concatenate(out)
+
+
 def int8_delta_report(
     fp32_path: str | Path, int8_path: str | Path, batch: np.ndarray, chunk: int = 8
 ) -> dict:
     """MOS deltas between fp32 and int8 forward artifacts (chunked: conv1
-    activations are ~74 MB/segment, so large batches OOM in one session run)."""
+    activations are ~74 MB/segment, so large batches OOM in one session run).
+    Accepts flat [B,144160] or device rows [1,901,160] artifacts on either side."""
     s32, s8 = ort_session(fp32_path), ort_session(int8_path)
-    name32 = s32.get_inputs()[0].name
-    name8 = s8.get_inputs()[0].name
-    mos32, mos8 = [], []
-    for i in range(0, batch.shape[0], chunk):
-        part = batch[i : i + chunk]
-        mos32.append(s32.run(None, {name32: part})[1])
-        mos8.append(s8.run(None, {name8: part})[1])
-    d = np.abs(np.concatenate(mos32) - np.concatenate(mos8))
+    d = np.abs(_fwd_mos(s32, batch, chunk) - _fwd_mos(s8, batch, chunk))
     return {
         "mean": d.mean(axis=0).tolist(),
         "p95": np.percentile(d, 95, axis=0).tolist(),
@@ -210,28 +220,38 @@ def check_op_vocabulary(model_path: str | Path, allowed: set[str] = STM32N6_ALLO
     return ops - allowed
 
 
-def check_device_constraints(model_path: str | Path) -> list[str]:
+def check_device_constraints(model_path: str | Path, max_opset: int = 13) -> list[str]:
     """Lint a device artifact against the ST Edge AI front-end constraints.
 
-    Returns a list of violation strings (empty = clean): opset <= 20, static
-    shapes, every I/O dim < 65536, batch 1, op vocabulary.
+    Returns a list of violation strings (empty = clean): opset <= max_opset
+    (ST's cap is 20; this project pins device exports to ST's recommended 13),
+    static shapes, EVERY tensor dim < 65536 (interior tensors included — the
+    ST front end rejects them the same as I/O), batch 1 on I/O, op vocabulary.
     """
     model = onnx.load(str(model_path))
     problems = []
     opset = {o.domain: o.version for o in model.opset_import}.get("", 0)
-    if opset > 20:
-        problems.append(f"opset {opset} > 20")
+    if opset > max_opset:
+        problems.append(f"opset {opset} > {max_opset}")
     extra = check_op_vocabulary(model_path)
     if extra:
         problems.append(f"ops outside STM32N6 vocabulary: {sorted(extra)}")
-    for vi in list(model.graph.input) + list(model.graph.output):
+    io_names = {vi.name for vi in list(model.graph.input) + list(model.graph.output)}
+    inferred = onnx.shape_inference.infer_shapes(model)
+    all_vi = (
+        list(inferred.graph.input)
+        + list(inferred.graph.output)
+        + list(inferred.graph.value_info)
+    )
+    for vi in all_vi:
         dims = vi.type.tensor_type.shape.dim
         for d in dims:
             if d.dim_param or d.dim_value <= 0:
-                problems.append(f"{vi.name}: non-static dim")
+                if vi.name in io_names:
+                    problems.append(f"{vi.name}: non-static dim")
             elif d.dim_value >= 65536:
                 problems.append(f"{vi.name}: dim {d.dim_value} >= 65536")
-        if len(dims) > 1 and dims[0].dim_value != 1:
+        if vi.name in io_names and len(dims) > 1 and dims[0].dim_value != 1:
             problems.append(f"{vi.name}: batch != 1")
     return problems
 
@@ -241,12 +261,16 @@ def int8_grad_report(fp32_path: str | Path, int8_path: str | Path, batch: np.nda
     s32, s8 = ort_session(fp32_path), ort_session(int8_path)
 
     def run(sess):
-        names = [i.name for i in sess.get_inputs()]
-        cos, ratio = [], []
+        inp = sess.get_inputs()[0]
+        w_name = sess.get_inputs()[1].name
+        grads = []
         for i in range(batch.shape[0]):
-            out = sess.run(None, {names[0]: batch[i : i + 1], names[1]: w})
-            cos.append(out[-1].ravel())
-        return cos
+            feed = batch[i : i + 1]
+            if len(inp.shape) == 3:  # device rows layout
+                feed = feed.reshape(1, inp.shape[1], inp.shape[2])
+            out = sess.run(None, {inp.name: feed, w_name: w})
+            grads.append(out[-1].ravel())
+        return grads
 
     g32, g8 = run(s32), run(s8)
     cos, ratio = [], []

@@ -84,15 +84,18 @@ if __name__ == "__main__":
         raise SystemExit(f"device constraint violations: {problems}")
 
     evalb = make_synthetic_batch(args.eval_segments, seed=999)
-    rep = int8_delta_report(art / "dnsmos_fwd_fp32.onnx", out, evalb)
-    print("MOS deltas vs original fp32 [SIG, BAK, OVRL]:")
-    for k, v in rep.items():
-        print(f"  {k}: {[f'{x:.4f}' for x in v]}")
     p95_gates = (0.18, 0.10, 0.10)
-    ok = all(m < 0.05 for m in rep["mean"]) and all(
-        p < g for p, g in zip(rep["p95"], p95_gates)
-    )
-    print("gate:", "PASS" if ok else "FAIL",
-          "(mean < 0.05 all; p95 < 0.18 SIG / 0.10 BAK,OVRL)")
-    if not ok:
+    failed = False
+    for tag, artifact in (("desktop", out), ("stm32n6", out_dev)):
+        rep = int8_delta_report(art / "dnsmos_fwd_fp32.onnx", artifact, evalb)
+        print(f"{tag} MOS deltas vs original fp32 [SIG, BAK, OVRL]:")
+        for k, v in rep.items():
+            print(f"  {k}: {[f'{x:.4f}' for x in v]}")
+        ok = all(m < 0.05 for m in rep["mean"]) and all(
+            p < g for p, g in zip(rep["p95"], p95_gates)
+        )
+        print(f"{tag} gate:", "PASS" if ok else "FAIL",
+              "(mean < 0.05 all; p95 < 0.18 SIG / 0.10 BAK,OVRL)")
+        failed |= not ok
+    if failed:
         raise SystemExit(1)

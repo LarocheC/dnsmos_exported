@@ -13,9 +13,11 @@ Two op-vocabulary modes:
   gradients use plain Conv with pre-flipped constant weights; max-pool routing
   uses equality masks (upsampled via concat-interleave) with tie counts built
   from AvgPool/ReduceMean + Clip + Reciprocal; ReLU/clamp masks use Equal; the
-  log backward uses Reciprocal. Ties are split evenly in both modes — with an
-  int8-quantized forward, ties in max windows are the norm (coarse value
-  grid), and overcounting them destroys the gradient direction.
+  log backward uses Reciprocal. Global-max ties are split evenly in BOTH
+  modes; max-pool ties are split evenly in device mode but routed to the
+  first argmax in ort mode (exact autograd semantics). Tie handling matters:
+  with an int8-quantized forward, ties in max windows are the norm (coarse
+  value grid), and overcounting them destroys the gradient direction.
 - ``mode="ort"``: exact autograd semantics (index-scatter max-pool routing,
   tie-splitting global max) for desktop ONNX Runtime, where ScatterElements
   and ConvTranspose are cheap.

@@ -14,15 +14,14 @@ dependencies = [
     "onnx>=1.16,<2",
     "onnxruntime>=1.19",
     "onnxscript>=0.7.1",
+    "onnxsim>=0.4",
     "soundfile>=0.12",
     "soxr>=0.3",
     "torch>=2.4",
-    "tqdm>=4.60",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-xdist>=3"]
-qat = ["torchao"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
