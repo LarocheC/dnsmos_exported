@@ -54,6 +54,12 @@ def main() -> None:
         from configs.student_small import StudentSmall
 
         student = StudentSmall()
+        # The frontend is frozen: it must carry the exact transplanted stft
+        # weights, not random init.
+        student.load_frontend_from_transplant(
+            torch.load(root / "models" / "dnsmos_transplanted.pt", map_location="cpu",
+                       weights_only=True)
+        )
         lr = args.lr or 3e-4
     elif args.init == "transplant":
         student = load_transplanted(root / "models" / "dnsmos_transplanted.pt")
@@ -61,15 +67,17 @@ def main() -> None:
     else:
         student = DnsmosModel()
         lr = args.lr or 3e-4
-    for p in student.parameters():
-        p.requires_grad_(True)
+    for name, p in student.named_parameters():
+        # The small student's frontend stays frozen (exact transplanted stft).
+        p.requires_grad_(not (args.student == "small" and name.startswith("frontend.")))
 
     train_ds = FileListAudioDataset(args.train_list, train=True)
     val_ds = FileListAudioDataset(args.val_list, train=False)
     train_dl = torch.utils.data.DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=2)
     val_dl = torch.utils.data.DataLoader(val_ds, batch_size=args.batch, num_workers=2)
 
-    opt = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=1e-5)
+    trainable = [p for p in student.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-5)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     best = float("inf")
 

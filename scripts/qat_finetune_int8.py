@@ -22,6 +22,11 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--calib-segments", type=int, default=16)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--init", type=Path, default=None,
+                        help="continue from these weights instead of the transplant")
+    parser.add_argument("--loss-weights", type=str, default="1,1,1",
+                        help="per-output MSE weights SIG,BAK,OVRL")
+    parser.add_argument("--seed-offset", type=int, default=2000)
     args = parser.parse_args()
 
     torch.set_num_threads(4)
@@ -35,7 +40,9 @@ if __name__ == "__main__":
 
     calib = torch.from_numpy(make_synthetic_batch(args.calib_segments, seed=100))
     ranges = calibrate_act_ranges(teacher, calib)
-    student = QatDnsmosModel(teacher, ranges)
+    init = load_transplanted(args.init) if args.init else teacher
+    student = QatDnsmosModel(init, ranges)
+    lw = torch.tensor([float(x) for x in args.loss_weights.split(",")])
 
     with torch.no_grad():
         base = torch.nn.functional.mse_loss(
@@ -45,11 +52,11 @@ if __name__ == "__main__":
 
     opt = torch.optim.Adam(student.trainable_parameters(), lr=args.lr)
     for step in range(args.steps):
-        wav = torch.from_numpy(make_synthetic_batch(args.batch, seed=2000 + step))
+        wav = torch.from_numpy(make_synthetic_batch(args.batch, seed=args.seed_offset + step))
         with torch.no_grad():
             target, _ = teacher(wav)
         raw, _ = student(wav)
-        loss = torch.nn.functional.mse_loss(raw, target)
+        loss = (lw * (raw - target) ** 2).mean()
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(student.trainable_parameters(), 1.0)

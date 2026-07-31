@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .[dev] onnxsim
+      - name: Tests (fast)
+        run: pytest -m "not slow" -q
+
+  artifacts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e . onnxsim
+      - name: Build fp32 artifacts
+        run: |
+          python scripts/download_official.py
+          python scripts/transplant_weights.py
+          python scripts/export_all_fp32.py
+      - name: Build int8 artifacts (PTQ fallback; QAT runs offline)
+        run: |
+          python scripts/export_int8.py || echo "::warning::int8 fwd gates need QAT weights"
+          python scripts/export_int8_loss.py
+      - name: Demo (PyTorch-free loop)
+        run: python examples/ondevice_demo.py --steps 80
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dnsmos-onnx-artifacts
+          path: |
+            artifacts/*.onnx
+            !artifacts/_int8_src/**
