@@ -27,6 +27,8 @@ if __name__ == "__main__":
     parser.add_argument("--loss-weights", type=str, default="1,1,1",
                         help="per-output MSE weights SIG,BAK,OVRL")
     parser.add_argument("--seed-offset", type=int, default=2000)
+    parser.add_argument("--float-tail", action="store_true",
+                        help="keep a7 + dense head float (see QatDnsmosModel)")
     args = parser.parse_args()
 
     torch.set_num_threads(4)
@@ -41,7 +43,7 @@ if __name__ == "__main__":
     calib = torch.from_numpy(make_synthetic_batch(args.calib_segments, seed=100))
     ranges = calibrate_act_ranges(teacher, calib)
     init = load_transplanted(args.init) if args.init else teacher
-    student = QatDnsmosModel(init, ranges)
+    student = QatDnsmosModel(init, ranges, float_tail=args.float_tail)
     lw = torch.tensor([float(x) for x in args.loss_weights.split(",")])
 
     with torch.no_grad():

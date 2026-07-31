@@ -117,6 +117,7 @@ def write_qdq_from_sim(
     fp32_path: str | Path,
     out_path: str | Path,
     act_ranges: dict[str, tuple[float, float]],
+    float_tail: bool = False,
 ) -> Path:
     """Insert QDQ into an exported forward graph using the sim's grids.
 
@@ -149,6 +150,8 @@ def write_qdq_from_sim(
     # Activation sites. Pools/ReduceMax reuse their input's params.
     b.qdq_activation(convs[0].input[0], *qp["feat"])
     for k, conv in enumerate(convs, start=1):
+        if float_tail and k == 7:
+            continue  # a7 and everything after stays float
         b.qdq_activation(relu_after(conv).output[0], *qp[f"a{k}"])
     for pool in [n for n in graph.node if n.op_type == "MaxPool"]:
         src_relu_site = None
@@ -159,11 +162,12 @@ def write_qdq_from_sim(
         if src_relu_site is None:
             raise RuntimeError(f"cannot map pool input {pool.input[0]} to a site")
         b.qdq_activation(pool.output[0], *qp[src_relu_site])
-    (rmax,) = [n for n in graph.node if n.op_type == "ReduceMax"]
-    b.qdq_activation(rmax.output[0], *qp["a7"])
-    b.qdq_activation(relu_after(gemms[0]).output[0], *qp["b1"])
-    b.qdq_activation(relu_after(gemms[1]).output[0], *qp["b2"])
-    b.qdq_activation(gemms[2].output[0], *qp["raw"])
+    if not float_tail:
+        (rmax,) = [n for n in graph.node if n.op_type == "ReduceMax"]
+        b.qdq_activation(rmax.output[0], *qp["a7"])
+        b.qdq_activation(relu_after(gemms[0]).output[0], *qp["b1"])
+        b.qdq_activation(relu_after(gemms[1]).output[0], *qp["b2"])
+        b.qdq_activation(gemms[2].output[0], *qp["raw"])
 
     # Weights and biases. Input-activation scale per layer for bias scaling.
     in_site = {0: "feat", 1: "a1", 2: "a2", 3: "a3", 4: "a4", 5: "a5", 6: "a6"}
@@ -172,12 +176,13 @@ def write_qdq_from_sim(
         w_scales = b.dq_weight(conv, w_name, inits[w_name])
         if len(conv.input) > 2:
             b.dq_bias(conv, conv.input[2], inits[conv.input[2]], qp[in_site[k]][0], w_scales)
-    gemm_in = {0: "a7", 1: "b1", 2: "b2"}
-    for k, gemm in enumerate(gemms):
-        w_name = gemm.input[1]
-        w_scales = b.dq_weight(gemm, w_name, inits[w_name])
-        if len(gemm.input) > 2:
-            b.dq_bias(gemm, gemm.input[2], inits[gemm.input[2]], qp[gemm_in[k]][0], w_scales)
+    if not float_tail:
+        gemm_in = {0: "a7", 1: "b1", 2: "b2"}
+        for k, gemm in enumerate(gemms):
+            w_name = gemm.input[1]
+            w_scales = b.dq_weight(gemm, w_name, inits[w_name])
+            if len(gemm.input) > 2:
+                b.dq_bias(gemm, gemm.input[2], inits[gemm.input[2]], qp[gemm_in[k]][0], w_scales)
 
     b.finalize()
     onnx.checker.check_model(model)

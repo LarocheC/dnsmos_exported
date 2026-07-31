@@ -91,11 +91,23 @@ def calibrate_act_ranges(
 
 
 class QatDnsmosModel(nn.Module):
-    """DnsmosModel body with frozen-range fake quantization for fine-tuning."""
+    """DnsmosModel body with frozen-range fake quantization for fine-tuning.
 
-    def __init__(self, model: DnsmosModel, act_ranges: dict[str, tuple[float, float]]) -> None:
+    ``float_tail=True`` keeps the a7 activation and the dense head in float
+    (conv7 weights stay int8): the head is ~0.4% of the MACs but gates the
+    heavy-tailed SIG error through the global max, so leaving it float buys a
+    large accuracy margin for negligible on-device cost.
+    """
+
+    def __init__(
+        self,
+        model: DnsmosModel,
+        act_ranges: dict[str, tuple[float, float]],
+        float_tail: bool = False,
+    ) -> None:
         super().__init__()
         self.model = copy.deepcopy(model)
+        self.float_tail = float_tail
         for p in self.model.frontend.parameters():
             p.requires_grad_(False)  # frontend is excluded from quantization
         for p in self.model.body.parameters():
@@ -113,14 +125,20 @@ class QatDnsmosModel(nn.Module):
         for k in range(1, 8):
             conv = getattr(body, f"conv{k}")
             x = torch.relu(nn.functional.conv2d(x, fq_weight(conv.weight), conv.bias, padding=1))
-            x = fq_act(x, *q[f"a{k}"])
+            if not (self.float_tail and k == 7):
+                x = fq_act(x, *q[f"a{k}"])
             if k in (4, 5, 6):
                 x = body.pool(x)
         x = torch.amax(x, dim=(2, 3))
-        x = torch.relu(nn.functional.linear(x, fq_weight(body.fc1.weight), body.fc1.bias))
-        x = fq_act(x, *q["b1"])
-        x = torch.relu(nn.functional.linear(x, fq_weight(body.fc2.weight), body.fc2.bias))
-        x = fq_act(x, *q["b2"])
-        raw = nn.functional.linear(x, fq_weight(body.fc3.weight), body.fc3.bias)
-        raw = fq_act(raw, *q["raw"])
+        if self.float_tail:
+            x = torch.relu(body.fc1(x))
+            x = torch.relu(body.fc2(x))
+            raw = body.fc3(x)
+        else:
+            x = torch.relu(nn.functional.linear(x, fq_weight(body.fc1.weight), body.fc1.bias))
+            x = fq_act(x, *q["b1"])
+            x = torch.relu(nn.functional.linear(x, fq_weight(body.fc2.weight), body.fc2.bias))
+            x = fq_act(x, *q["b2"])
+            raw = nn.functional.linear(x, fq_weight(body.fc3.weight), body.fc3.bias)
+            raw = fq_act(raw, *q["raw"])
         return raw, poly(raw)
