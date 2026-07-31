@@ -189,9 +189,10 @@ def int8_delta_report(fp32_path: str | Path, int8_path: str | Path, batch: np.nd
 # in the ST Neural-ART mapping table (HW or documented SW fallback) or purely
 # structural. Log is a documented float SW epoch (frontend only, by design).
 STM32N6_ALLOWED_OPS = {
-    "Add", "Cast", "Clip", "Concat", "Constant", "Conv", "Equal", "Gemm",
-    "Log", "MatMul", "MaxPool", "Mul", "Pad", "Reciprocal", "ReduceMax",
-    "Relu", "Reshape", "Slice", "Squeeze", "Sub", "Transpose", "Unsqueeze",
+    "Add", "AveragePool", "Cast", "Clip", "Concat", "Constant", "Conv",
+    "Equal", "Gemm", "GlobalAveragePool", "Log", "MatMul", "MaxPool", "Mul",
+    "Pad", "Reciprocal", "ReduceMax", "ReduceMean", "Relu", "Reshape",
+    "Slice", "Squeeze", "Sub", "Transpose", "Unsqueeze",
     "QuantizeLinear", "DequantizeLinear",
 }
 

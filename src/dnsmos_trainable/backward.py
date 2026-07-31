@@ -11,10 +11,11 @@ Two op-vocabulary modes:
 - ``mode="device"`` (default): STM32N6-safe. No ScatterElements, ConvTranspose,
   Resize, Expand, Where, Greater, ReduceSum, or tensor-divisor Div. Conv input
   gradients use plain Conv with pre-flipped constant weights; max-pool routing
-  uses equality masks (upsampled via concat-interleave); ReLU/clamp masks use
-  Equal; the log backward uses Reciprocal. Tie handling: gradients are routed
-  to *every* argmax on exact float ties (overcount) instead of being split —
-  ties are measure-zero on real audio.
+  uses equality masks (upsampled via concat-interleave) with tie counts built
+  from AvgPool/ReduceMean + Clip + Reciprocal; ReLU/clamp masks use Equal; the
+  log backward uses Reciprocal. Ties are split evenly in both modes — with an
+  int8-quantized forward, ties in max windows are the norm (coarse value
+  grid), and overcounting them destroys the gradient direction.
 - ``mode="ort"``: exact autograd semantics (index-scatter max-pool routing,
   tie-splitting global max) for desktop ONNX Runtime, where ScatterElements
   and ConvTranspose are cheap.
@@ -52,17 +53,22 @@ def poly_bwd(g_mos: torch.Tensor, raw: torch.Tensor, c2: torch.Tensor, c1: torch
 
 
 def global_maxpool_bwd(g_y: torch.Tensor, x: torch.Tensor, y: torch.Tensor, mode: str) -> torch.Tensor:
-    """VJP of y = amax(x, dims=(2,3)). Equality-mask routing.
+    """VJP of y = amax(x, dims=(2,3)). Equality-mask routing, ties split evenly.
 
-    "ort" splits gradient evenly across ties (matches torch.amax backward);
-    "device" routes the full gradient to every tie (no ReduceSum/Div on device).
+    Both modes split the gradient across ties (matching torch.amax backward).
+    Tie handling is not optional: with an int8-quantized forward, ties inside
+    max reductions are ubiquitous (coarse value grid), and routing the full
+    gradient to every tie decorrelates the input gradient completely. "device"
+    phrases the tie count with ReduceMean/Reciprocal/Clip (NPU-mapped) instead
+    of ReduceSum/Div (software fallback on ST Neural-ART).
     """
     mask = (x == y[:, :, None, None]).to(x.dtype)
     g = g_y[:, :, None, None]
     if mode == "ort":
         ties = mask.sum(dim=(2, 3), keepdim=True).clamp(min=1.0)
         return mask / ties * g
-    return mask * g
+    count = mask.mean(dim=(2, 3), keepdim=True) * float(x.shape[2] * x.shape[3])
+    return mask * g * torch.reciprocal(torch.clamp(count, min=1.0))
 
 
 def _interleave2x(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -77,8 +83,13 @@ def maxpool2d_bwd_device(g_y: torch.Tensor, x: torch.Tensor, y: torch.Tensor) ->
     """VJP of y = max_pool2d(x, 2, 2) from basic ops (STM32N6-safe).
 
     Upsample y and g_y by 2x nearest (concat-interleave), zero-pad to x's odd
-    spatial dims, then route with an equality mask. Padded rows/cols receive
-    zero gradient by construction (g_up is zero there). Ties overcount.
+    spatial dims, route with an equality mask, and split the gradient evenly
+    among within-window ties (per-window tie count via AvgPool*4, upsampled,
+    Clip(min=1) so zero-padded edges stay finite, Reciprocal instead of Div).
+    Tie splitting is essential once the forward is int8-quantized: the coarse
+    value grid makes multi-cell ties the norm, and overcounting them wrecks
+    the gradient direction. Padded rows/cols receive zero gradient by
+    construction (g_up is zero there).
     """
     y_up = _interleave2x(_interleave2x(y, 2), 3)
     g_up = _interleave2x(_interleave2x(g_y, 2), 3)
@@ -87,7 +98,11 @@ def maxpool2d_bwd_device(g_y: torch.Tensor, x: torch.Tensor, y: torch.Tensor) ->
     y_up = F.pad(y_up, (0, pad_w, 0, pad_h))
     g_up = F.pad(g_up, (0, pad_w, 0, pad_h))
     mask = (x == y_up).to(x.dtype)
-    return mask * g_up
+    win_ties = F.avg_pool2d(mask, 2, 2) * 4.0
+    ties_up = _interleave2x(_interleave2x(win_ties, 2), 3)
+    ties_up = F.pad(ties_up, (0, pad_w, 0, pad_h))
+    inv_ties = torch.reciprocal(torch.clamp(ties_up, min=1.0))
+    return mask * g_up * inv_ties
 
 
 def maxpool2d_bwd_ort(g_y: torch.Tensor, indices: torch.Tensor, input_shape: list[int]) -> torch.Tensor:

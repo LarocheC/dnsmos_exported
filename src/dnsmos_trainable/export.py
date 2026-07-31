@@ -151,31 +151,160 @@ QUANT_OP_TYPES = ["Conv", "Gemm", "MatMul"]
 def list_matmul_frontend_nodes(model_path: str | Path) -> list[str]:
     """Names of MatMul nodes belonging to the stft frontend (must stay float).
 
-    Identified structurally: their constant input is one of the two
-    [161, 320]-shaped stft matrices (in either orientation).
+    Identified structurally: an input traces back — possibly through
+    Transpose/Reshape/Identity (the exporter feeds `frames @ w.T` via a
+    Transpose of the initializer) — to one of the two [161, 320]-shaped stft
+    matrices (in either orientation).
     """
     model = onnx.load(str(model_path))
-    from onnx import numpy_helper
 
     stft_shapes = {(161, 320), (320, 161)}
     inits = {t.name: tuple(t.dims) for t in model.graph.initializer}
-    # Constant nodes can also carry the weight (dynamo export style).
     const_shapes = {}
+    by_output = {}
     for node in model.graph.node:
+        for out in node.output:
+            by_output[out] = node
         if node.op_type == "Constant":
             for attr in node.attribute:
                 if attr.name == "value":
                     const_shapes[node.output[0]] = tuple(attr.t.dims)
+
+    def source_shape(name: str, hops: int = 4):
+        for _ in range(hops):
+            shape = inits.get(name) or const_shapes.get(name)
+            if shape is not None:
+                return shape
+            prod = by_output.get(name)
+            if prod is None or prod.op_type not in ("Transpose", "Reshape", "Identity"):
+                return None
+            name = prod.input[0]
+        return None
+
     names = []
     for node in model.graph.node:
         if node.op_type != "MatMul":
             continue
         for inp in node.input:
-            shape = inits.get(inp) or const_shapes.get(inp)
-            if shape in stft_shapes:
+            if source_shape(inp) in stft_shapes:
                 names.append(node.name)
                 break
     return names
+
+
+def list_shared_weight_matmuls(model_path: str | Path) -> list[str]:
+    """MatMul nodes whose constant input is shared with a Gemm/Conv.
+
+    The dynamo exporter deduplicates identical initializers, so a loss graph's
+    backward MatMul `g @ W` reuses the forward Gemm's weight tensor. ORT's
+    per-channel quantizer assigns those consumers different channel axes and
+    its int32-bias scale adjustment then crashes (scale count vs bias length
+    mismatch). These MatMuls are tiny; keep them float.
+    """
+    model = onnx.load(str(model_path))
+    consumers: dict[str, set[str]] = {}
+    for node in model.graph.node:
+        for inp in node.input[1:]:
+            consumers.setdefault(inp, set()).add(node.op_type)
+    names = []
+    for node in model.graph.node:
+        if node.op_type != "MatMul":
+            continue
+        for inp in node.input:
+            if consumers.get(inp, set()) - {"MatMul"}:
+                names.append(node.name)
+                break
+    return names
+
+
+_MASK_CHAIN_OPS = {"MaxPool", "ReduceMax", "Unsqueeze", "Reshape", "Concat", "Pad",
+                   "QuantizeLinear", "DequantizeLinear", "Squeeze", "Transpose"}
+
+
+def repair_mask_consistency(model_path: str | Path) -> int:
+    """Make equality masks quantization-consistent after QDQ insertion.
+
+    The loss graph routes max-pool/global-max gradients with `Equal(x, max_up)`
+    masks. quantize_static rewires *some* consumers of a quantized tensor to
+    the DequantizeLinear output and leaves others on the float instance, so a
+    mask can end up comparing a float tensor against a dequantized max — which
+    is never equal, silently zeroing the whole gradient. For each such Equal,
+    this pass rebuilds the max-side chain (MaxPool/ReduceMax + reshaping)
+    rooted at the exact tensor instance the mask reads, skipping Q/DQ pairs;
+    max-of-the-same-tensor is then exact by construction. Returns the number
+    of repaired masks.
+    """
+    model = onnx.load(str(model_path))
+    graph = model.graph
+    nodes = list(graph.node)
+    by_output = {out: n for n in nodes for out in n.output}
+    inits = {t.name for t in graph.initializer}
+
+    def chain_to_source(tensor: str) -> tuple[list, str] | None:
+        """Walk producer chain up through mask-chain ops; return (chain, source)."""
+        chain = []
+        cur = tensor
+        while True:
+            prod = by_output.get(cur)
+            if prod is None:
+                return None
+            chain.append(prod)
+            if prod.op_type in ("MaxPool", "ReduceMax"):
+                return chain, prod.input[0]
+            if prod.op_type not in _MASK_CHAIN_OPS:
+                return None
+            cur = prod.input[0]
+
+    def strip_qdq(name: str) -> str:
+        for suffix in ("_DequantizeLinear_Output", "_QuantizeLinear_Output"):
+            if name.endswith(suffix):
+                return name[: -len(suffix)]
+        return name
+
+    repaired = 0
+    new_nodes: list = []
+    for node in nodes:
+        insert_before: list = []
+        if node.op_type == "Equal":
+            a, b = node.input[0], node.input[1]
+            if b not in inits and by_output.get(b) is not None:
+                walk = chain_to_source(b)
+                if walk is not None:
+                    chain, source = walk
+                    has_qdq = any(
+                        n.op_type in ("QuantizeLinear", "DequantizeLinear") for n in chain
+                    )
+                    if source != a or has_qdq:
+                        # Rebuild the chain rooted at `a`, skipping Q/DQ nodes.
+                        keep = [n for n in reversed(chain) if n.op_type not in
+                                ("QuantizeLinear", "DequantizeLinear")]
+                        if keep and strip_qdq(source) == strip_qdq(a):
+                            cur, prev_orig = a, source
+                            for i, orig in enumerate(keep):
+                                clone = onnx.NodeProto()
+                                clone.CopyFrom(orig)
+                                clone.name = f"{node.name}_maskchain_{i}"
+                                # Rewire every input matching the original
+                                # predecessor (Concat "stack" repeats it).
+                                for j, inp in enumerate(clone.input):
+                                    if inp == prev_orig or strip_qdq(inp) == strip_qdq(prev_orig):
+                                        clone.input[j] = cur
+                                out_name = f"{clone.name}_out"
+                                prev_orig = orig.output[0]
+                                del clone.output[:]
+                                clone.output.append(out_name)
+                                insert_before.append(clone)
+                                cur = out_name
+                            node.input[1] = cur
+                            repaired += 1
+        new_nodes.extend(insert_before)
+        new_nodes.append(node)
+
+    del graph.node[:]
+    graph.node.extend(new_nodes)
+    onnx.checker.check_model(model)
+    onnx.save(model, str(model_path))
+    return repaired
 
 
 def quantize_qdq(
@@ -186,6 +315,7 @@ def quantize_qdq(
     per_channel: bool = True,
     calibrate_method=None,
     extra_options: dict | None = None,
+    preprocessed: bool = False,
 ) -> Path:
     """Static QDQ int8 quantization (ss/sa scheme: symmetric per-channel
     weights, asymmetric per-tensor activations) matching the ST Neural-ART
@@ -203,10 +333,16 @@ def quantize_qdq(
         calibrate_method = CalibrationMethod.MinMax
 
     fp32_path, out_path = Path(fp32_path), Path(out_path)
-    pre_path = out_path.with_suffix(".preproc.onnx")
-    # ORT's symbolic shape inference asserts on dynamo graphs with a symbolic
-    # batch dim; plain ONNX shape inference (still applied) is sufficient here.
-    quant_pre_process(str(fp32_path), str(pre_path), skip_symbolic_shape=True)
+    if preprocessed:
+        # Caller already ran quant_pre_process — REQUIRED when extra_exclude
+        # names were read from the graph: preprocessing renames nodes, so
+        # names from the unprocessed graph would silently exclude nothing.
+        pre_path = fp32_path
+    else:
+        pre_path = out_path.with_suffix(".preproc.onnx")
+        # ORT's symbolic shape inference asserts on dynamo graphs with a
+        # symbolic batch dim; plain ONNX shape inference still applies.
+        quant_pre_process(str(fp32_path), str(pre_path), skip_symbolic_shape=True)
 
     class _Reader(CalibrationDataReader):
         def __init__(self, batches):
@@ -215,7 +351,7 @@ def quantize_qdq(
         def get_next(self):
             return next(self._it, None)
 
-    exclude = list_matmul_frontend_nodes(pre_path)
+    exclude = list_matmul_frontend_nodes(pre_path) + list_shared_weight_matmuls(pre_path)
     if extra_exclude:
         exclude += list(extra_exclude)
 
@@ -232,7 +368,11 @@ def quantize_qdq(
         calibrate_method=calibrate_method,
         extra_options=extra_options or {},
     )
-    pre_path.unlink(missing_ok=True)
+    if not preprocessed:
+        pre_path.unlink(missing_ok=True)
+    repaired = repair_mask_consistency(out_path)
+    if repaired:
+        print(f"repaired {repaired} quantization-inconsistent equality masks")
     onnx.checker.check_model(str(out_path))
     return out_path
 

@@ -44,9 +44,15 @@ def fq_weight(w: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def calibrate_act_ranges(
-    model: DnsmosModel, wavs: torch.Tensor, percentile: float = 99.9
+    model: DnsmosModel, wavs: torch.Tensor, percentile: float = 100.0
 ) -> dict[str, tuple[float, float]]:
-    """Percentile activation ranges per site over a calibration batch."""
+    """Activation ranges per site over a calibration batch.
+
+    Default is min/max (percentile=100): this network max-pools everywhere,
+    so percentile clipping removes exactly the activation peaks that the
+    MaxPool/global-max select and wrecks the quantized model. (Subsampling to
+    200k values per site already acts as a mild outlier filter.)
+    """
     lo_q, hi_q = (100.0 - percentile) / 100.0, percentile / 100.0
     samples: dict[str, list[torch.Tensor]] = {s: [] for s in ACT_SITES}
 
