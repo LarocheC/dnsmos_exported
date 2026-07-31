@@ -185,6 +185,50 @@ def int8_delta_report(fp32_path: str | Path, int8_path: str | Path, batch: np.nd
     }
 
 
+# Op vocabulary allowed in STM32N6 device artifacts. Everything here is either
+# in the ST Neural-ART mapping table (HW or documented SW fallback) or purely
+# structural. Log is a documented float SW epoch (frontend only, by design).
+STM32N6_ALLOWED_OPS = {
+    "Add", "Cast", "Clip", "Concat", "Constant", "Conv", "Equal", "Gemm",
+    "Log", "MatMul", "MaxPool", "Mul", "Pad", "Reciprocal", "ReduceMax",
+    "Relu", "Reshape", "Slice", "Squeeze", "Sub", "Transpose", "Unsqueeze",
+    "QuantizeLinear", "DequantizeLinear",
+}
+
+
+def check_op_vocabulary(model_path: str | Path, allowed: set[str] = STM32N6_ALLOWED_OPS) -> set[str]:
+    """Return the set of ops in the graph that are NOT in the allowed set."""
+    model = onnx.load(str(model_path))
+    ops = {node.op_type for node in model.graph.node}
+    return ops - allowed
+
+
+def check_device_constraints(model_path: str | Path) -> list[str]:
+    """Lint a device artifact against the ST Edge AI front-end constraints.
+
+    Returns a list of violation strings (empty = clean): opset <= 20, static
+    shapes, every I/O dim < 65536, batch 1, op vocabulary.
+    """
+    model = onnx.load(str(model_path))
+    problems = []
+    opset = {o.domain: o.version for o in model.opset_import}.get("", 0)
+    if opset > 20:
+        problems.append(f"opset {opset} > 20")
+    extra = check_op_vocabulary(model_path)
+    if extra:
+        problems.append(f"ops outside STM32N6 vocabulary: {sorted(extra)}")
+    for vi in list(model.graph.input) + list(model.graph.output):
+        dims = vi.type.tensor_type.shape.dim
+        for d in dims:
+            if d.dim_param or d.dim_value <= 0:
+                problems.append(f"{vi.name}: non-static dim")
+            elif d.dim_value >= 65536:
+                problems.append(f"{vi.name}: dim {d.dim_value} >= 65536")
+        if len(dims) > 1 and dims[0].dim_value != 1:
+            problems.append(f"{vi.name}: batch != 1")
+    return problems
+
+
 def int8_grad_report(fp32_path: str | Path, int8_path: str | Path, batch: np.ndarray, w: np.ndarray) -> dict:
     """Gradient quality of an int8 loss graph vs its fp32 reference."""
     s32, s8 = ort_session(fp32_path), ort_session(int8_path)

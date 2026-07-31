@@ -184,16 +184,29 @@ def quantize_qdq(
     calibration_batches: "list[dict[str, np.ndarray]]",
     extra_exclude: list[str] | None = None,
     per_channel: bool = True,
+    calibrate_method=None,
+    extra_options: dict | None = None,
 ) -> Path:
     """Static QDQ int8 quantization (ss/sa scheme: symmetric per-channel
     weights, asymmetric per-tensor activations) matching the ST Neural-ART
     requirements as well as stock ORT expectations."""
-    from onnxruntime.quantization import CalibrationDataReader, QuantFormat, QuantType, quantize_static
+    from onnxruntime.quantization import (
+        CalibrationDataReader,
+        CalibrationMethod,
+        QuantFormat,
+        QuantType,
+        quantize_static,
+    )
     from onnxruntime.quantization.shape_inference import quant_pre_process
+
+    if calibrate_method is None:
+        calibrate_method = CalibrationMethod.MinMax
 
     fp32_path, out_path = Path(fp32_path), Path(out_path)
     pre_path = out_path.with_suffix(".preproc.onnx")
-    quant_pre_process(str(fp32_path), str(pre_path))
+    # ORT's symbolic shape inference asserts on dynamo graphs with a symbolic
+    # batch dim; plain ONNX shape inference (still applied) is sufficient here.
+    quant_pre_process(str(fp32_path), str(pre_path), skip_symbolic_shape=True)
 
     class _Reader(CalibrationDataReader):
         def __init__(self, batches):
@@ -216,6 +229,8 @@ def quantize_qdq(
         per_channel=per_channel,
         op_types_to_quantize=QUANT_OP_TYPES,
         nodes_to_exclude=exclude,
+        calibrate_method=calibrate_method,
+        extra_options=extra_options or {},
     )
     pre_path.unlink(missing_ok=True)
     onnx.checker.check_model(str(out_path))
