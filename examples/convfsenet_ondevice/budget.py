@@ -27,6 +27,7 @@ import dsp  # noqa: E402
 
 MB = 1024 * 1024
 NOEXTMEM_POOL = 2.8 * MB
+PSRAM = 32 * MB
 
 
 def weight_bytes(model_path: Path) -> int:
@@ -78,14 +79,49 @@ def macs(model_path: Path) -> int:
     return total
 
 
-def peak_activation_bytes(model_path: Path, dtype_bytes: int) -> int:
-    """Crude high-water mark: the largest single intermediate tensor."""
+_ELEM_BYTES = {
+    onnx.TensorProto.FLOAT: 4, onnx.TensorProto.FLOAT16: 2, onnx.TensorProto.DOUBLE: 8,
+    onnx.TensorProto.INT8: 1, onnx.TensorProto.UINT8: 1, onnx.TensorProto.BOOL: 1,
+    onnx.TensorProto.INT16: 2, onnx.TensorProto.UINT16: 2,
+    onnx.TensorProto.INT32: 4, onnx.TensorProto.UINT32: 4,
+    onnx.TensorProto.INT64: 8, onnx.TensorProto.UINT64: 8,
+}
+
+
+def peak_activation(model_path: Path):
+    """Largest live intermediate tensor: (bytes, name, dims, dtype).
+
+    Uses each tensor's REAL dtype — a QDQ int8 graph still carries fp32
+    tensors wherever nodes were excluded from quantization, and charging
+    1 byte/element there understates the peak fourfold. Dequantized *weights*
+    are excluded: they are persistent parameters, not activations.
+    """
     m = onnx.shape_inference.infer_shapes(onnx.load(str(model_path)))
-    peak = 0
+    inits = {t.name for t in m.graph.initializer}
+    producers = {o: n for n in m.graph.node for o in n.output}
+    passthrough = ("DequantizeLinear", "QuantizeLinear", "Cast", "Transpose", "Identity")
+
+    def is_weight(name: str) -> bool:
+        cur = name
+        for _ in range(4):
+            node = producers.get(cur)
+            if node is None:
+                return cur in inits
+            if node.op_type not in passthrough:
+                return False
+            cur = node.input[0]
+        return False
+
+    best = (0, "", [], 0)
     for vi in list(m.graph.value_info) + list(m.graph.output):
         dims = [d.dim_value if d.dim_value > 0 else 1 for d in vi.type.tensor_type.shape.dim]
-        peak = max(peak, int(np.prod(dims)) * dtype_bytes)
-    return peak
+        if not dims or is_weight(vi.name):
+            continue
+        et = vi.type.tensor_type.elem_type
+        nbytes = int(np.prod(dims)) * _ELEM_BYTES.get(et, 4)
+        if nbytes > best[0]:
+            best = (nbytes, vi.name, dims, et)
+    return best
 
 
 def main() -> None:
@@ -143,18 +179,17 @@ def main() -> None:
     working = sum(b for _, b in work)
     print(f"  {'TOTAL working':<48s} {working/MB:9.2f} MB")
 
-    print("\n== Transient activation peaks (one session at a time) ==")
+    print("\n== Transient activation peaks (largest live tensor, real dtype) ==")
     peaks = []
-    if trunk_i8.exists():
-        peaks.append((f"trunk int8 (emit_T window)", peak_activation_bytes(trunk_i8, 1)))
-    if head_f.exists():
-        peaks.append(("head forward (fp32)", peak_activation_bytes(head_f, 4)))
-    if head_b.exists():
-        peaks.append(("head backward (fp32)", peak_activation_bytes(head_b, 4)))
-    if loss_i8.exists():
-        peaks.append(("DNSMOS loss graph int8", peak_activation_bytes(loss_i8, 1)))
-    for label, b in peaks:
-        print(f"  {label:<48s} {b/1024:9.1f} KiB")
+    for path, label in ((trunk_i8, "trunk int8 (emit_T window)"),
+                        (head_f, "head forward"),
+                        (head_b, "head backward"),
+                        (dnsmos_path, "DNSMOS loss graph (fused fwd+bwd)")):
+        if path.exists():
+            nbytes, name, dims, et = peak_activation(path)
+            tag = "fp32" if et == onnx.TensorProto.FLOAT else f"dt{et}"
+            peaks.append((label, nbytes))
+            print(f"  {label:<40s} {nbytes/1024:9.1f} KiB  {tag} {dims}")
     act_peak = max((b for _, b in peaks), default=0)
 
     print("\n== Compute per adaptation window ==")
@@ -197,26 +232,35 @@ def main() -> None:
 
     dnsmos_peak = next((b for lbl, b in peaks if lbl.startswith("DNSMOS")), 0)
     enh_peak = max((b for lbl, b in peaks if not lbl.startswith("DNSMOS")), default=0)
-    enh_total = persistent - (weight_bytes(dnsmos_path) if dnsmos_path.exists() else 0) \
-        + working + enh_peak
+    enh_persistent = persistent - (weight_bytes(dnsmos_path) if dnsmos_path.exists() else 0)
+    enh_total = enh_persistent + working + enh_peak
     total = persistent + working + act_peak
 
     print("\n== Fit ==")
-    print(f"  enhancer side only (trunk + head + training buffers) = {enh_total/MB:5.2f} MB")
-    print(f"  + DNSMOS loss graph activation peak                  = {dnsmos_peak/MB:5.2f} MB")
-    print(f"  TOTAL                                                = {total/MB:5.2f} MB")
-    print(f"  n6-noextmem usable pools                             ~{NOEXTMEM_POOL/MB:5.2f} MB")
+    print(f"  enhancer side (trunk + head + training buffers)   = {enh_total/MB:6.2f} MB")
+    print(f"  DNSMOS loss graph activation peak                 = {dnsmos_peak/MB:6.2f} MB")
+    print(f"  TOTAL                                             = {total/MB:6.2f} MB")
+    print(f"  n6-noextmem usable pools                          ~{NOEXTMEM_POOL/MB:6.2f} MB")
+    print(f"  N6570-DK external hexa-SPI PSRAM                   {PSRAM/MB:6.2f} MB")
     print()
-    if enh_total < NOEXTMEM_POOL:
-        print("  -> The ConvFSENet half (inference + on-device training of the mask")
-        print("     head) FITS in internal SRAM. The DNSMOS teacher is what forces")
-        print("     external memory: its fused fwd+bwd graph peaks at "
-              f"{dnsmos_peak/MB:.1f} MB of")
-        print("     activations because it scores a whole 9.01 s segment at once.")
-    print("  -> As built, the loop needs the N6570-DK's 32 MB hexa-SPI PSRAM")
-    print("     (profile n6-allmems-O3). To reach an internal-SRAM-only build,")
-    print("     distill the compact DNSMOS student (configs/student_small.py in")
-    print("     this repo) and re-export its loss graph.")
+    if enh_total >= NOEXTMEM_POOL:
+        print(f"  -> Even the enhancer half ({enh_total/MB:.2f} MB) exceeds the "
+              f"{NOEXTMEM_POOL/MB:.1f} MB internal pools,")
+        print("     dominated by the 9.01 s working buffers "
+              f"({working/MB:.2f} MB). Shortening the")
+        print("     adaptation window scales those down linearly.")
+    if dnsmos_peak > PSRAM:
+        print(f"  -> The full-size DNSMOS loss graph does NOT fit the N6570-DK: a")
+        print(f"     single live activation is {dnsmos_peak/MB:.1f} MB > {PSRAM/MB:.0f} MB PSRAM.")
+        print("     Its int8 body is fine; the fp32 backward tail (nodes held out of")
+        print("     quantization to protect gradient quality) is what blows up, at")
+        print("     128 x 900 x 161 x 4 B per tensor.")
+        print("     => The compact DNSMOS student (configs/student_small.py) is a")
+        print("        REQUIREMENT for STM32N6, not an optimization: stride-2 first")
+        print("        conv and 16 channels cut that tensor ~32x.")
+    else:
+        print("  -> Fits the N6570-DK with weights/activations in external PSRAM")
+        print("     (profile n6-allmems-O3).")
 
 
 if __name__ == "__main__":

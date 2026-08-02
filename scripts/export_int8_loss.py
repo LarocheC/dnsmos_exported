@@ -38,6 +38,7 @@ from dnsmos_trainable import load_transplanted
 from dnsmos_trainable.backward import DnsmosLossGraph
 from dnsmos_trainable.export import export_loss_graph, make_calibration_batches, quantize_qdq
 from dnsmos_trainable.verify import (
+    DNSMOS_DEVICE_OPS,
     check_device_constraints,
     int8_grad_report,
     make_synthetic_batch,
@@ -160,7 +161,7 @@ if __name__ == "__main__":
             pre_rows, art / "dnsmos_loss_int8_qdq_stm32n6.onnx", calib_rows,
             extra_exclude=bwd_rows[:depth], preprocessed=True,
         )
-        problems = check_device_constraints(out_dev)
+        problems = check_device_constraints(out_dev, allowed=DNSMOS_DEVICE_OPS)
         if problems:
             raise SystemExit(f"device constraint violations: {problems}")
         rep_dev = int8_grad_report(art / "dnsmos_loss_fp32_stm32n6.onnx", out_dev, evalb, W)

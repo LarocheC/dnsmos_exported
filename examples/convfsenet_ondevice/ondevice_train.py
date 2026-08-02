@@ -15,8 +15,13 @@ Per 9.01 s adaptation window:
   NPU   dnsmos_loss(enhanced, w)           -> scores, dL/d(enhanced)
   M55   + SI-SNR anchor gradient
   M55   ISTFT-adjoint, mask VJP            -> dL/dmask [1, 256, 564]
-  NPU   head_bwd(dmask, mask, h)           -> dW [256,192], db [256]
+  M55   head_bwd(dmask, mask, h)           -> dW [256,192], db [256]
   M55   Adam step on (W, b)                                       49,408 params
+
+(head_fwd and head_bwd are ONNX graphs but land on the M55, not the NPU: the
+Neural-ART maps MatMul to hardware only when the second operand is constant,
+and both of theirs are runtime tensors. At 27.7 MMAC each, once per window,
+that is affordable; the trunk and DNSMOS are what need the NPU.)
 
 The gradient never enters the trunk: the head is the last layer and the mask is
 a real gain on the noisy spectrum, so no trunk activations are stashed and no

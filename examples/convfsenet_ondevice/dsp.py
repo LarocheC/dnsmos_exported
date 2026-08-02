@@ -50,7 +50,19 @@ def num_frames(n_samples: int, hop: int = HOP) -> int:
 
 def stft(x: np.ndarray, n_fft: int = N_FFT, hop: int = HOP,
          win_length: int = WIN_LENGTH) -> np.ndarray:
-    """[S] real -> [F, T] complex, matching torch.stft(center=True)."""
+    """[S] real -> [F, T] complex, matching torch.stft(center=True).
+
+    Requires len(x) > n_fft//2 and win_length == n_fft, which is the deployed
+    geometry. numpy's reflect pad would happily multi-reflect a shorter buffer
+    and return numbers torch.stft refuses to produce, so reject it explicitly
+    rather than silently diverging from the documented contract.
+    """
+    if win_length != n_fft:
+        raise ValueError(f"win_length must equal n_fft here (got {win_length} vs {n_fft})")
+    if len(x) <= n_fft // 2:
+        raise ValueError(
+            f"need more than n_fft//2 = {n_fft // 2} samples for center padding, got {len(x)}"
+        )
     w = hann_periodic(win_length)
     xp = _pad_center(np.asarray(x, dtype=np.float64), n_fft)
     T = num_frames(len(x), hop)

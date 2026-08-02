@@ -51,6 +51,15 @@ jobs:
           python scripts/export_int8_loss.py
       - name: Demo (PyTorch-free loop)
         run: python examples/ondevice_demo.py --steps 80
+      - name: ConvFSENet on-device training demo
+        run: |
+          python examples/convfsenet_ondevice/export_demo_artifacts.py
+          python examples/convfsenet_ondevice/budget.py
+          python examples/convfsenet_ondevice/ondevice_train.py --steps 25
+      - name: Demo gates (need the artifacts built above)
+        # Without this the artifact-dependent tests skip silently, including
+        # the ST Edge AI device lint.
+        run: pytest tests/test_convfsenet_demo.py -q
       - uses: actions/upload-artifact@v4
         with:
           name: dnsmos-onnx-artifacts

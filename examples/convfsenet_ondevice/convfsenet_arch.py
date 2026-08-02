@@ -54,8 +54,10 @@ class WindowedTCMBlock(nn.Module):
 
     Shrinks the time axis by trim=(K-1)*D and crops the residual to match, so a
     window of L+T columns collapses to T with no padding and no FIFO state —
-    upstream's Track 1 rework, which removes the Slice/Concat/Gather ops that
-    always fall back to M55-Hybrid epochs on the Neural-ART.
+    upstream's Track 1 rework, which removes the *state-plumbing*
+    Slice/Concat/Gather ops that always fall back to M55-Hybrid epochs on the
+    Neural-ART. (The 9 static residual-crop Slices remain; it is the per-frame
+    state movement that is eliminated, not every Slice.)
     """
 
     def __init__(self, dilation: int) -> None:

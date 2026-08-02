@@ -131,7 +131,33 @@ def test_head_equals_conv1d():
     h = torch.randn(1, 192, 32, dtype=torch.float64)
     W = head.conv.weight.detach().squeeze(-1)
     got = HeadForward()(h, W, head.conv.bias.detach())
-    assert torch.equal(got, head(h))
+    # matmul and Conv1d(k=1) are the same map but not contractually bit-identical.
+    assert torch.allclose(got, head(h), atol=1e-12, rtol=0)
+
+
+@pytest.mark.parametrize("B", [1, 2, 3])
+def test_head_backward_reduces_over_batch(B):
+    """Guard the squeeze-vs-sum trap: weight grads must sum over the batch."""
+    torch.manual_seed(11)
+    F, C, T = 8, 5, 6
+    h = torch.randn(B, C, T, dtype=torch.float64)
+    W = torch.randn(F, C, dtype=torch.float64)
+    b = torch.randn(F, dtype=torch.float64)
+    dmask = torch.randn(B, F, T, dtype=torch.float64)
+
+    Wv, bv = W.clone().requires_grad_(True), b.clone().requires_grad_(True)
+    dW_ref, db_ref = torch.autograd.grad(head_reference_loss(h, Wv, bv, dmask), [Wv, bv])
+    dW, db = HeadBackward()(dmask, HeadForward()(h, W, b), h)
+    assert dW.shape == (F, C) and db.shape == (F,)
+    assert torch.allclose(dW, dW_ref, atol=1e-12)
+    assert torch.allclose(db, db_ref, atol=1e-12)
+
+
+def test_stft_rejects_too_short_input():
+    """The 'matches torch.stft' contract must not silently hold for buffers
+    torch would refuse (numpy reflect-pads them happily)."""
+    with pytest.raises(ValueError):
+        dsp.stft(np.zeros(100))
 
 
 @pytest.mark.skipif(not ECO8.exists(), reason="eco8-neaixt clone not present")
@@ -315,6 +341,86 @@ def test_int8_trunk_tracks_fp32():
         b = i8.run(None, {"noisy_mag_window": x})[0].ravel()
         cos.append(float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)))
     assert min(cos) > 0.95, cos
+
+
+@skip_artifacts
+def test_compression_prologue_stays_float():
+    """The exporter's headline fidelity feature, asserted rather than printed.
+
+    If the eps-Add/Pow prologue were quantized, raw |STFT| would land on a
+    coarse int8 grid and lose exactly the low-energy detail the compression
+    exists to preserve. Structural check: the graph input must reach Add->Pow
+    before any QuantizeLinear.
+    """
+    import onnx
+
+    m = onnx.load(str(ARTIFACTS / "convfsenet_trunk_int8.onnx"))
+    producers = {o: n for n in m.graph.node for o in n.output}
+    consumers = {}
+    for n in m.graph.node:
+        for i in n.input:
+            consumers.setdefault(i, []).append(n)
+
+    cur = m.graph.input[0].name
+    chain = []
+    for _ in range(4):
+        nxt = consumers.get(cur, [])
+        assert len(nxt) == 1, f"unexpected fan-out at {cur}"
+        node = nxt[0]
+        chain.append(node.op_type)
+        if node.op_type == "QuantizeLinear":
+            break
+        cur = node.output[0]
+    assert chain[:2] == ["Add", "Pow"], chain
+    assert "QuantizeLinear" in chain, chain
+    # ...and quantization must actually be present downstream.
+    assert sum(1 for n in m.graph.node if n.op_type == "QuantizeLinear") > 5
+
+
+@skip_artifacts
+def test_ondevice_loop_runs_and_improves():
+    """Execute the shipping loop itself: run_trunk windowing, Nyquist handling,
+    loss reshape and hinge sign are otherwise uncovered by the unit tests."""
+    import importlib
+
+    ort = pytest.importorskip("onnxruntime")
+    loss_graph = ROOT / "artifacts" / "dnsmos_loss_fp32.onnx"
+    if not loss_graph.exists():
+        pytest.skip("run scripts/export_all_fp32.py first")
+
+    mod = importlib.import_module("ondevice_train")
+    eng = mod.OnDeviceEnhancer(ARTIFACTS, loss_graph, use_int8_trunk=True)
+    noisy, _ = mod.make_noisy(0)
+    X, mag = eng.analyse(noisy)
+    h = eng.run_trunk(mag)
+    assert h.shape == (1, 192, X.shape[1])
+
+    W = np.zeros((eng.n_features, 192), dtype=np.float64)
+    b = np.full(eng.n_features, 4.0, dtype=np.float64)
+    w_vec = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+    opt = mod.NpAdam([W.shape, b.shape], lr=3e-3)
+
+    mask = eng.mask_of(h, W, b)
+    enhanced, _ = eng.synthesise(X, mask, len(noisy))
+    # Pass-through init must reproduce the input up to the ~0.982 gain.
+    assert np.corrcoef(enhanced, noisy)[0, 1] > 0.99
+    mos_start, _ = eng.dnsmos(enhanced, w_vec)
+
+    for _ in range(8):
+        mask = eng.mask_of(h, W, b)
+        enhanced, _ = eng.synthesise(X, mask, len(noisy))
+        _, g = eng.dnsmos(enhanced, w_vec)
+        gY = dsp.istft_adjoint(g.astype(np.float64), T=X.shape[1])
+        dmask = dsp.mask_grad(X, gY)[: eng.n_features][None]
+        dW, db = eng.head_grads(dmask, mask, h)
+        uW, ub = opt.step([dW, db])
+        W -= uW
+        b -= ub
+
+    mask = eng.mask_of(h, W, b)
+    enhanced, _ = eng.synthesise(X, mask, len(noisy))
+    mos_end, _ = eng.dnsmos(enhanced, w_vec)
+    assert mos_end[2] > mos_start[2] + 0.1, (mos_start[2], mos_end[2])
 
 
 @skip_artifacts

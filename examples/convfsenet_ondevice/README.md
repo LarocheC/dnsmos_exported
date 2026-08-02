@@ -28,7 +28,7 @@ python budget.py                    # STM32N6 memory / MAC accounting
 | 5 | scores **and** `dL/d(enhanced)` | **NPU, int8** | `dnsmos_loss_int8_qdq_stm32n6.onnx` |
 | 6 | SI-SNR anchor gradient | M55 | `dsp.sisnr_and_grad` |
 | 7 | ISTFT-adjoint → mask VJP → `dL/dmask` | M55 | `dsp.istft_adjoint` |
-| 8 | `dW [256,192]`, `db [256]` | NPU-eligible | `convfsenet_head_bwd.onnx` |
+| 8 | `dW [256,192]`, `db [256]` | M55 (both operands dynamic) | `convfsenet_head_bwd.onnx` |
 | 9 | Adam step on `(W, b)` | M55 | `NpAdam`, ~20 lines |
 
 ## The idea that makes it fit: train the last layer only
@@ -45,9 +45,9 @@ produces is a **real gain applied to the noisy complex STFT**. Two consequences:
    does today.
 
 Adding on-device training to the existing ConvFSENet deployment therefore costs
-**0.57 MB** of new persistent state (head + Adam moments + the DNSMOS graph's
-weights are separate) rather than the ~17 MB that full-network training would
-need for gradients and optimizer state.
+**0.57 MB** of new persistent state for the head and its Adam moments (1.91 MB
+once the DNSMOS graph's own weights are counted), rather than the ~17 MB of
+gradients and optimizer state that full-network training would need.
 
 Weights `W` and `b` are **runtime graph inputs**, not baked-in initializers, so
 the optimizer updates them in RAM with no regeneration or reflash. The cost:
@@ -56,7 +56,7 @@ two head matmuls run as M55 software epochs (27.7 MMAC each, once per window).
 
 ## Verified, not asserted
 
-`pytest tests/test_convfsenet_demo.py` (17 tests) gates every link:
+`pytest tests/test_convfsenet_demo.py` (24 tests) gates every link:
 
 | claim | gate |
 |---|---|
@@ -68,8 +68,16 @@ two head matmuls run as M55 software epochs (27.7 MMAC each, once per window).
 | head backward == autograd | < 1e-12 relative |
 | **whole chain** (ISTFT-adjoint → mask VJP → head backward) == autograd through (head → mask → complex mul → ISTFT) | **< 1e-9 relative** |
 | ONNX artifacts == torch modules | < 1e-5 / 1e-3 |
+| head backward reduces over the batch | vs autograd at B = 1, 2, 3 |
 | int8 trunk tracks fp32 | cosine > 0.95 |
+| compression prologue stays fp32 | graph input reaches `Add`→`Pow` before any `QuantizeLinear` |
+| `--checkpoint` loader | bit-exact vs upstream from a synthetic eco8 checkpoint |
+| the loop itself (`OnDeviceEnhancer`) | runs, and OVRL rises in 8 steps |
 | every artifact | passes the ST Edge AI front-end lint |
+
+The two rows marked bit-exact need the upstream clone at `/workspace/eco8-neaixt`
+and are skipped without it; the artifact rows need
+`export_demo_artifacts.py` to have been run.
 
 ## Result
 
@@ -96,7 +104,7 @@ nothing needs constraining. Raising the floor shows the anchor is functional
 rather than decorative:
 
 ```
---sisnr-floor 25 :  OVRL 1.329 -> 2.173   SI-SNR pinned at 25.4-26.4 dB
+--sisnr-floor 25 :  OVRL 1.329 -> ~2.2    SI-SNR pinned at 25-26 dB
 --sisnr-floor  6 :  OVRL 1.329 -> 2.342   SI-SNR drifts to 15.9 dB
 ```
 
@@ -121,29 +129,49 @@ and the same loop performs genuine on-device adaptation.
 ```
 Persistent          ConvFSENet trunk int8 weights          1.45 MB
                     DNSMOS loss graph int8 weights         1.35 MB
-                    head W,b + Adam moments                0.57 MB   <- new for training
+                    head W,b + Adam moments                0.57 MB
+                    (persistent NEW for training: 1.91 MB, incl. the DNSMOS weights)
 Working buffers     STFT, mask, gradients (9.01 s window)  5.01 MB
-Activation peak     DNSMOS fused fwd+bwd graph            17.69 MB   <- dominates
-                    ConvFSENet trunk (emit_T=64 window)    0.07 MB
+Activation peak     DNSMOS fused fwd+bwd graph            70.75 MB   <- dominates
+                    ConvFSENet trunk (emit_T=64 window)     0.16 MB
+                    head fwd / bwd                          0.55 MB
 Compute             trunk 1,094 MMAC + head 55 MMAC + DNSMOS 38,823 MMAC
                     = 39,972 MMAC per window; 17-121 s extrapolated from
                       eco8's measured 0.33-2.41 GMAC/s on target
 ```
 
-**The enhancer half fits in internal SRAM; DNSMOS is what forces external
-memory.** Its fused forward+backward graph peaks at 17.7 MB because DNSMOS's
-first convolution expands a 900×161 spectrogram to 128 channels, and it scores a
-whole 9.01 s segment at once. As built, the loop needs the N6570-DK's 32 MB
-hexa-SPI PSRAM (`n6-allmems-O3`). For an internal-SRAM-only build, distill the
-compact DNSMOS student in this repo (`configs/student_small.py`: stride-2 first
-conv, 16 channels → ~0.58 MB activation peak, a 32× reduction) and re-export its
-loss graph.
+**The full-size DNSMOS loss graph does not fit the STM32N6 — not even with the
+DK's 32 MB PSRAM.** A single live activation is 70.75 MB: DNSMOS's first
+convolution expands a 900×161 spectrogram to 128 channels, and the backward
+tail nodes held out of quantization (to protect gradient quality) carry that
+tensor in **fp32**, at 128 × 900 × 161 × 4 B. The int8 body is not the problem.
 
-Note also that windowing the trunk at `emit_T=64` costs ~32 % more MACs than
-upstream's `emit_T=1` streaming graph (1,094 vs 829 MMAC per 9.01 s), because
-each window recomputes the 42-column receptive-field context. That is the
-deliberate trade Track 1 makes: fewer, larger epochs and no `Slice`/`Concat`/
-`Gather` state plumbing, which is ConvFSENet's M55 floor on the Neural-ART.
+So the compact DNSMOS student in this repo (`configs/student_small.py`:
+stride-2 first conv, 16 channels → ~32× smaller peak) is a **requirement** for
+this target, not an optimization. Distill it and re-export its loss graph before
+attempting a board bring-up.
+
+The enhancer half is 7.57 MB — also above the 2.8 MB `n6-noextmem` pools, but
+that is dominated by the 5.01 MB of 9.01 s working buffers, which scale down
+linearly if you shorten the adaptation window.
+
+### Why `emit_T=64`
+
+Windowing recomputes the 42-column receptive-field context on every call, so
+the cost is strongly non-linear in `emit_T` (measured with `budget.macs`):
+
+| trunk configuration | MMAC per 9.01 s |
+|---|---:|
+| windowed, `emit_T=1` (upstream's Track 1 default) | 19,282 |
+| windowed, `emit_T=8` | 3,117 |
+| **windowed, `emit_T=64` (this demo)** | **1,094** |
+| windowed, `emit_T=564` (whole segment at once) | 815 |
+| streaming FIFO, `T=1` (what eco8 deploys today) | 829 |
+
+`emit_T=64` is 17.6× cheaper than `emit_T=1` and within 1.32× of the stateful
+streaming graph, while keeping Track 1's benefit — no per-frame
+`Slice`/`Concat`/`Gather` state plumbing, which is ConvFSENet's M55 floor on the
+Neural-ART. Larger `emit_T` is cheaper still but grows the activation window.
 
 ## Compiling for the chip
 
@@ -169,12 +197,13 @@ $STEDGEAI generate -m ../../artifacts/dnsmos_loss_int8_qdq_stm32n6.onnx \
   --fix-parametric-shapes "{'B':1}" --native-float -n dnsmos_loss -o /tmp/gen_dnsmos
 ```
 
-`--native-float` is required: every graph here deliberately keeps some ops in
-float (ConvFSENet's magnitude-compression prologue, DNSMOS's log frontend and
-gradient tail), and without the flag the compiler refuses a partially quantized
-network. Read `network_generate_report.txt` for the epoch count and HW/hybrid/SW
-split before writing any runtime code — that is upstream's own de-risking
-pattern (`deploy/stm32n6/scripts/build_gate0d_probe.py`).
+Note `--native-float` is **not** in upstream's `generate.sh`, and upstream
+compiles the same partially-quantized ConvFSENet topology (fp32 Pow/Add
+prologue + int8 body) without it. Try it without the flag first; add it only if
+the compiler objects to the DNSMOS gradient graph, whose float tail is a much
+larger fraction of the network. Read `network_generate_report.txt` for the epoch
+count and HW/hybrid/SW split before writing any runtime code — that is
+upstream's own de-risking pattern (`deploy/stm32n6/scripts/build_gate0d_probe.py`).
 
 Runtime integration extends `deploy/stm32n6/app/ai_dpu_se_stream.c`: it already
 does multi-I/O with `memcpy` feedback between sessions, which is the mechanism

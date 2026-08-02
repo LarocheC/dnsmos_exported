@@ -35,6 +35,7 @@ from dnsmos_trainable.export import export_forward
 from dnsmos_trainable.qat import calibrate_act_ranges
 from dnsmos_trainable.qdq_writer import write_qdq_from_sim
 from dnsmos_trainable.verify import (
+    DNSMOS_DEVICE_OPS,
     check_device_constraints,
     int8_delta_report,
     make_synthetic_batch,
@@ -79,7 +80,7 @@ if __name__ == "__main__":
         src_dev, art / "dnsmos_fwd_int8_qdq_stm32n6.onnx", ranges, float_tail=float_tail
     )
 
-    problems = check_device_constraints(out_dev)
+    problems = check_device_constraints(out_dev, allowed=DNSMOS_DEVICE_OPS)
     if problems:
         raise SystemExit(f"device constraint violations: {problems}")
 

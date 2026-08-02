@@ -232,7 +232,19 @@ STM32N6_ALLOWED_OPS = {
 # backward deliberately avoids them. Kept as a separate, reportable tier.
 STM32N6_SOFTWARE_OPS = {
     "ReduceSum", "Greater", "GreaterOrEqual", "Less", "LessOrEqual", "Log",
-    "Gather", "Tile", "Resize", "Floor", "Ceil", "Round",
+    "Gather", "Tile", "Resize",
+}
+
+# Stricter policy for THIS repo's hand-written DNSMOS backward: the whole point
+# of `DnsmosLossGraph(mode="device")` is to avoid ops that cost an M55 software
+# epoch (ReduceSum -> ReduceMean*N, tensor-Div -> Reciprocal*Mul, Greater ->
+# Equal) or that ST Edge AI cannot import at all. Passing this set to
+# check_device_constraints keeps those substitutions from silently regressing —
+# STM32N6_ALLOWED_OPS alone would accept the un-substituted forms because they
+# ARE in ST's mapping table, just slowly.
+DNSMOS_DEVICE_OPS = STM32N6_ALLOWED_OPS - {
+    "ConvTranspose", "Div", "Greater", "GreaterOrEqual", "Less", "LessOrEqual",
+    "ReduceSum", "Resize", "Gather", "Tile",
 }
 
 
@@ -254,6 +266,7 @@ def check_device_constraints(
     max_opset: int = 13,
     allow_dynamic_batch: bool = False,
     batched_io: "set[str] | None" = None,
+    allowed: "set[str] | None" = None,
 ) -> list[str]:
     """Lint a device artifact against the ST Edge AI front-end constraints.
 
@@ -276,7 +289,7 @@ def check_device_constraints(
     opset = {o.domain: o.version for o in model.opset_import}.get("", 0)
     if opset > max_opset:
         problems.append(f"opset {opset} > {max_opset}")
-    extra = check_op_vocabulary(model_path)
+    extra = check_op_vocabulary(model_path, allowed or STM32N6_ALLOWED_OPS)
     if extra:
         problems.append(f"ops outside STM32N6 vocabulary: {sorted(extra)}")
     io_names = {vi.name for vi in list(model.graph.input) + list(model.graph.output)}

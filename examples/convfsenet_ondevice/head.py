@@ -8,8 +8,9 @@ feeds them in each call.
 The cost of that choice, on the Neural-ART: a MatMul is HW-mapped only when its
 second input is constant, so these two MatMuls run as software epochs on the
 Cortex-M55. At 256x192x564 = 27.7 MMAC each and one update per 9.01 s window,
-that is the right trade — the frozen trunk (1.44 MMAC *per frame*, 564 frames)
-is what needs the NPU.
+that is the right trade — the frozen trunk (1.39 M parameters, ~1.94 MMAC per
+emitted frame in this demo's emit_T=64 windowed configuration) is what needs
+the NPU.
 
 Shapes (T = mask columns per window, F = frequency bins):
     h      [1, 192, T]     trunk output
@@ -46,10 +47,13 @@ class HeadBackward(nn.Module):
     """
 
     def forward(self, dmask: torch.Tensor, mask: torch.Tensor, h: torch.Tensor):
-        dz = dmask * mask * (1.0 - mask)                       # [1, F, T]
-        dW = torch.matmul(dz, h.transpose(1, 2)).squeeze(0)    # [F, 192]
+        dz = dmask * mask * (1.0 - mask)                       # [B, F, T]
+        # sum(0), not squeeze(0): weight gradients accumulate over the batch.
+        # squeeze is a silent no-op for B>1 and would return unreduced
+        # per-sample gradients, which HeadForward would happily have produced.
+        dW = torch.matmul(dz, h.transpose(1, 2)).sum(0)        # [F, 192]
         n_t = float(dz.shape[-1])
-        db = (dz.mean(dim=-1) * n_t).squeeze(0)                # [F]
+        db = (dz.mean(dim=-1) * n_t).sum(0)                    # [F]
         return dW, db
 
 
