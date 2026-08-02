@@ -201,15 +201,38 @@ def int8_delta_report(
     }
 
 
-# Op vocabulary allowed in STM32N6 device artifacts. Everything here is either
-# in the ST Neural-ART mapping table (HW or documented SW fallback) or purely
-# structural. Log is a documented float SW epoch (frontend only, by design).
+# Ops present in the ST Neural-ART operator-mapping table (HW, hybrid, or a
+# documented SW_INT/SW_FLOAT fallback on the Cortex-M55). Anything absent from
+# this set is either un-importable by ST Edge AI Core or of undocumented
+# behaviour on the N6 — e.g. Where, Expand, Scatter*, TopK, LayerNormalization.
 STM32N6_ALLOWED_OPS = {
-    "Add", "AveragePool", "Cast", "Clip", "Concat", "Constant", "Conv",
-    "Equal", "Gemm", "GlobalAveragePool", "Log", "MatMul", "MaxPool", "Mul",
-    "Pad", "Reciprocal", "ReduceMax", "ReduceMean", "Relu", "Reshape",
-    "Slice", "Squeeze", "Sub", "Transpose", "Unsqueeze",
-    "QuantizeLinear", "DequantizeLinear",
+    # structural / data movement
+    "Cast", "Concat", "Constant", "Gather", "Pad", "Reshape", "Slice",
+    "Split", "Squeeze", "Tile", "Transpose", "Unsqueeze",
+    # arithmetic
+    "Abs", "Add", "Div", "Max", "Min", "Mul", "Neg", "Pow", "Reciprocal",
+    "Sqrt", "Sub",
+    # activations
+    "Clip", "Elu", "Erf", "Exp", "HardSigmoid", "LeakyRelu", "Log", "PRelu",
+    "Relu", "Selu", "Sigmoid", "Softmax", "Tanh",
+    # comparison
+    "Equal", "Greater", "GreaterOrEqual", "Less", "LessOrEqual",
+    # reductions / pooling
+    "AveragePool", "GlobalAveragePool", "GlobalMaxPool", "MaxPool",
+    "ReduceMax", "ReduceMean", "ReduceMin", "ReduceSum",
+    # linear algebra
+    "Conv", "ConvTranspose", "Gemm", "MatMul", "Resize",
+    # quantization
+    "QuantizeLinear", "DequantizeLinear", "QLinearConv", "QLinearMatMul",
+}
+
+# Ops that ST maps only to a *software* epoch on the M55 (or that force a
+# float fallback). Legal, but each one costs an NPU pipeline teardown, a
+# memory round-trip and cache maintenance — so the hand-written DNSMOS
+# backward deliberately avoids them. Kept as a separate, reportable tier.
+STM32N6_SOFTWARE_OPS = {
+    "ReduceSum", "Greater", "GreaterOrEqual", "Less", "LessOrEqual", "Log",
+    "Gather", "Tile", "Resize", "Floor", "Ceil", "Round",
 }
 
 
@@ -220,13 +243,33 @@ def check_op_vocabulary(model_path: str | Path, allowed: set[str] = STM32N6_ALLO
     return ops - allowed
 
 
-def check_device_constraints(model_path: str | Path, max_opset: int = 13) -> list[str]:
+def software_epoch_ops(model_path: str | Path) -> set[str]:
+    """Ops in the graph that ST maps to a Cortex-M55 software epoch."""
+    model = onnx.load(str(model_path))
+    return {node.op_type for node in model.graph.node} & STM32N6_SOFTWARE_OPS
+
+
+def check_device_constraints(
+    model_path: str | Path,
+    max_opset: int = 13,
+    allow_dynamic_batch: bool = False,
+    batched_io: "set[str] | None" = None,
+) -> list[str]:
     """Lint a device artifact against the ST Edge AI front-end constraints.
 
-    Returns a list of violation strings (empty = clean): opset <= max_opset
-    (ST's cap is 20; this project pins device exports to ST's recommended 13),
-    static shapes, EVERY tensor dim < 65536 (interior tensors included — the
-    ST front end rejects them the same as I/O), batch 1 on I/O, op vocabulary.
+    Returns a list of violation strings (empty = clean):
+
+    - opset <= max_opset (ST's cap is 20; this repo pins DNSMOS device exports
+      to ST's recommended 13, and the eco8-neaixt convention is 17);
+    - EVERY tensor dim < 65536, interior tensors included (the ST front end
+      rejects them the same as I/O) — checked via shape inference;
+    - static I/O shapes. `allow_dynamic_batch=True` permits a symbolic dim 0,
+      which is what upstream's `--fix-parametric-shapes "{'B':1}"` pins at
+      generate time;
+    - batch 1 on batched I/O. `batched_io` names which tensors are batched;
+      the default (None) applies the rule to every rank>1 I/O, which is right
+      for activation-only graphs but wrong for graphs that take weight
+      matrices as runtime inputs.
     """
     model = onnx.load(str(model_path))
     problems = []
@@ -245,14 +288,18 @@ def check_device_constraints(model_path: str | Path, max_opset: int = 13) -> lis
     )
     for vi in all_vi:
         dims = vi.type.tensor_type.shape.dim
-        for d in dims:
+        for axis, d in enumerate(dims):
             if d.dim_param or d.dim_value <= 0:
-                if vi.name in io_names:
-                    problems.append(f"{vi.name}: non-static dim")
+                if vi.name in io_names and not (allow_dynamic_batch and axis == 0):
+                    problems.append(f"{vi.name}: non-static dim (axis {axis})")
             elif d.dim_value >= 65536:
                 problems.append(f"{vi.name}: dim {d.dim_value} >= 65536")
-        if vi.name in io_names and len(dims) > 1 and dims[0].dim_value != 1:
-            problems.append(f"{vi.name}: batch != 1")
+        if vi.name not in io_names or len(dims) <= 1:
+            continue
+        is_batched = vi.name in batched_io if batched_io is not None else True
+        d0 = dims[0]
+        if is_batched and not d0.dim_param and d0.dim_value not in (0, 1):
+            problems.append(f"{vi.name}: batch {d0.dim_value} != 1")
     return problems
 
 

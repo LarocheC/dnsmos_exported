@@ -9,3 +9,4 @@ artifacts/
 *.onnx
 *.pt
 .venv/
+examples/convfsenet_ondevice/artifacts/
