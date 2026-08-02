@@ -100,16 +100,59 @@ has the machinery: `common/discriminator.py` retrains its PESQ predictor on the
 generator's *current* outputs every step. A frozen, offline-distilled proxy has
 no such defence.
 
-## 5. Recommendation
+## 5. The fix is not a better student — it is no student at all
 
-1. **Do not size the DNSMOS student for memory.** The frontier is wide; even a
-   9.01 s, 64-bin, quarter-width student fits on-chip with 40× margin. Spend
-   that margin on proxy fidelity, not on shrinking.
-2. **Refresh the proxy on-policy.** The student must see the enhancer's own
-   current outputs, MetricGAN-style, or it will be exploited. On-device that
-   means either periodically re-distilling the student's last layers against
-   occasional full-DNSMOS evaluations, or shipping a proxy trained on a data
-   distribution that already includes adapted outputs.
+The failure above is *not* the distribution shift MetricGAN addresses. Measuring
+`cos(grad_student, grad_official)` on the very clips the student was trained on,
+before any adaptation:
+
+```
+mean cosine +0.0002        (int8-vs-fp32 gradients of the SAME model score 0.41)
+```
+
+The gradient is **orthogonal** to the truth. Matching `f` does not constrain
+`grad f`: score distillation transfers values, not derivatives. Adding an
+explicit Sobolev term (`--sobolev 3.0`, cosine loss against cached teacher
+gradients) moved it from 0.003 to 0.006 in 300 steps — matching a direction in
+144,160 dimensions is hard, and near-chance is ~0.0026.
+
+So stop distilling. **The official DNSMOS topology is fully convolutional up to
+a *global* max pool, so the exact published weights accept any window length**
+≥ 8 frames. Cropping the window costs nothing to build and keeps the gradient
+field intact:
+
+| window | peak int8 | GMAC | OVRL corr vs 9.01 s | grad cosine |
+|---:|---:|---:|---:|---:|
+| 9.01 s | 17.69 MB | 38.8 | 1.000 | 1.0000 |
+| 4.00 s | 7.84 MB | 17.2 | 0.998 | **0.495** |
+| **2.00 s** | **3.91 MB** | **8.6** | **0.910** | **0.452** |
+| 1.00 s | 1.95 MB | 4.3 | 0.734 | 0.255 |
+| 0.50 s | 0.96 MB | 2.1 | 0.193 | 0.113 |
+
+Functionally, on the same clip and protocol as the student:
+
+| gradient source | ΔTRUE OVRL |
+|---|---:|
+| distilled 9.01 s student (1.76 MB) | **−0.178** |
+| full official, 9.01 s (17.7 MB int8) | +0.151 |
+| **official weights, 2 s crop (3.91 MB int8)** | **+0.494** |
+
+A 2 s crop of the real model is 4.5× cheaper than the full one, fits the compute
+budget (8.6 of 2.2–15.7 GMAC), and steers *better* than either alternative.
+
+## 6. Recommendation
+
+1. **Do not distill a student.** Crop the window on the official weights
+   instead. Recommended operating point: **2 s window, official weights, int8**
+   — 3.91 MB activation peak, 8.6 GMAC, gradient cosine 0.45, and the best
+   measured effect on the true metric of anything tested.
+2. **MetricGAN is not needed for this problem, but is still the answer to the
+   next one.** On-policy refresh fixes proxy *drift*; it does not create a
+   gradient field that was never there. Once you are steering with real
+   weights, drift and metric-hacking become the live risks — note that even the
+   full official model drives the mask to 0.05 and SI-SNR downward. That is
+   where co-training (`common/discriminator.py` in eco8-neaixt) earns its
+   keep.
 3. **Keep the SI-SNR anchor and make it tight.** It is what stops both the
    proxy and the true metric from being gamed; in the runs above the mask
    reaches 0.05 (near-total gating of some bins) before the anchor engages.
