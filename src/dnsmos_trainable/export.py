@@ -6,6 +6,7 @@ its cap is 20; the dynamo exporter cannot go below 18), static batch 1,
 [1, 901, 160] I/O so every tensor dim stays below the device's 65536 limit.
 """
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -174,6 +175,74 @@ def export_loss_graph(loss: DnsmosLossGraph, out_path: str | Path) -> Path:
 # Ops eligible for QDQ insertion. The frontend/backward tails are protected by
 # node exclusion lists computed from the actual artifact, never hardcoded.
 QUANT_OP_TYPES = ["Conv", "Gemm", "MatMul"]
+
+# The backward's elementwise tail is what actually sets the activation peak:
+# `relu_mask` materializes Equal -> Cast -> Sub -> Mul at conv1's full size, and
+# none of those are in ORT's QDQ registry, so they hold the largest tensor in
+# the graph in fp32 -- a 4x penalty on the number that decides whether the
+# artifact fits on-chip.
+#
+# ORT will quantize them generically if they are registered against
+# QDQOperatorBase, but only Mul and Sub may be. Measured on the 1 s crop, by
+# gradient norm against the un-quantized-elementwise baseline (11.07):
+#
+#     +Sub   11.07   harmless
+#     +Mul    0.00   DESTROYS the gradient when applied to every Mul
+#     +Add    0.54   severe degradation
+#
+# Mul is both the one that matters for memory and the dangerous one. The
+# resolution is to quantize elementwise nodes only where they set the peak
+# (see `large_elementwise_nodes`): the small Muls deep in the fc backward
+# carry the surviving gradient signal and cost nothing to leave in float.
+ELEMENTWISE_QUANT_OPS = ("Mul", "Sub")
+
+
+@contextmanager
+def _elementwise_qdq_registered(op_types):
+    """Temporarily teach ORT's QDQ quantizer about elementwise ops.
+
+    `QDQRegistry` is module-global, so this restores it rather than leaving
+    the process's quantizer permanently altered.
+    """
+    from onnxruntime.quantization.operators.qdq_base_operator import QDQOperatorBase
+    from onnxruntime.quantization.registry import QDQRegistry
+
+    saved = {op: QDQRegistry.get(op) for op in op_types}
+    try:
+        for op in op_types:
+            QDQRegistry[op] = QDQOperatorBase
+        yield
+    finally:
+        for op, prev in saved.items():
+            if prev is None:
+                QDQRegistry.pop(op, None)
+            else:
+                QDQRegistry[op] = prev
+
+
+def large_elementwise_nodes(model_path: str | Path, ops=ELEMENTWISE_QUANT_OPS
+                            ) -> tuple[list[str], list[str]]:
+    """Split elementwise nodes into (peak-setting, negligible).
+
+    A node is peak-setting when its fp32 output would be larger than the whole
+    graph's activation peak once quantized -- i.e. `elems > peak_elems / 4`.
+    Those are exactly the tensors that stop the artifact fitting a pool; every
+    other elementwise node is left in float, which is both safer for the
+    gradient and free.
+    """
+    m = onnx.shape_inference.infer_shapes(onnx.load(str(model_path)))
+    sizes = {}
+    for vi in list(m.graph.value_info) + list(m.graph.output):
+        dims = [d.dim_value if d.dim_value > 0 else 1 for d in vi.type.tensor_type.shape.dim]
+        sizes[vi.name] = int(np.prod(dims)) if dims else 0
+    peak = max(sizes.values(), default=0)
+    cutoff = peak / 4.0
+    big, small = [], []
+    for node in m.graph.node:
+        if node.op_type not in ops:
+            continue
+        (big if sizes.get(node.output[0], 0) > cutoff else small).append(node.name)
+    return big, small
 
 
 def list_matmul_frontend_nodes(model_path: str | Path) -> list[str]:
@@ -344,10 +413,18 @@ def quantize_qdq(
     calibrate_method=None,
     extra_options: dict | None = None,
     preprocessed: bool = False,
+    quantize_elementwise: bool = False,
 ) -> Path:
     """Static QDQ int8 quantization (ss/sa scheme: symmetric per-channel
     weights, asymmetric per-tensor activations) matching the ST Neural-ART
-    requirements as well as stock ORT expectations."""
+    requirements as well as stock ORT expectations.
+
+    `quantize_elementwise` additionally quantizes the peak-setting Mul/Sub
+    nodes of the hand-written backward -- the difference between an artifact
+    whose largest activation is fp32 and one where it is int8, and so between
+    needing PSRAM and fitting `n6-noextmem`. See `ELEMENTWISE_QUANT_OPS` for
+    why it is deliberately not applied to every elementwise node.
+    """
     from onnxruntime.quantization import (
         CalibrationDataReader,
         CalibrationMethod,
@@ -383,19 +460,30 @@ def quantize_qdq(
     if extra_exclude:
         exclude += list(extra_exclude)
 
-    quantize_static(
-        str(pre_path),
-        str(out_path),
-        _Reader(calibration_batches),
-        quant_format=QuantFormat.QDQ,
-        activation_type=QuantType.QInt8,
-        weight_type=QuantType.QInt8,
-        per_channel=per_channel,
-        op_types_to_quantize=QUANT_OP_TYPES,
-        nodes_to_exclude=exclude,
-        calibrate_method=calibrate_method,
-        extra_options=extra_options or {},
-    )
+    op_types = list(QUANT_OP_TYPES)
+    registered = ()
+    if quantize_elementwise:
+        registered = ELEMENTWISE_QUANT_OPS
+        op_types += list(registered)
+        big, small = large_elementwise_nodes(pre_path, registered)
+        if not big:
+            raise RuntimeError("quantize_elementwise: no peak-setting elementwise nodes found")
+        exclude += small
+
+    with _elementwise_qdq_registered(registered):
+        quantize_static(
+            str(pre_path),
+            str(out_path),
+            _Reader(calibration_batches),
+            quant_format=QuantFormat.QDQ,
+            activation_type=QuantType.QInt8,
+            weight_type=QuantType.QInt8,
+            per_channel=per_channel,
+            op_types_to_quantize=op_types,
+            nodes_to_exclude=exclude,
+            calibrate_method=calibrate_method,
+            extra_options=extra_options or {},
+        )
     if not preprocessed:
         pre_path.unlink(missing_ok=True)
     repaired = repair_mask_consistency(out_path)

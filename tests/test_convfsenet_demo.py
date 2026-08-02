@@ -486,3 +486,68 @@ def test_cropped_model_scores_track_the_full_window():
                             for x in (clean, noisy))
     assert f_clean > f_noisy, (f_clean, f_noisy)
     assert c_clean > c_noisy, (c_clean, c_noisy)
+
+
+# --------------------------------------------------------------------------
+# Elementwise quantization of the backward tail (FEASIBILITY.md 5e). Quantizing
+# EVERY Mul zeroes the gradient outright, so the library restricts it to the
+# peak-setting nodes. Both halves of that are worth guarding: the node split,
+# and the fact that gradients survive it.
+
+CROP1S = DEMO / "artifacts_crop1s"
+CROP1S_EW = DEMO / "artifacts_crop1s_ew"
+
+
+def test_large_elementwise_nodes_splits_on_the_peak():
+    from dnsmos_trainable.export import large_elementwise_nodes
+
+    src = CROP1S_EW / "crop1s_pre.onnx"
+    if not src.exists():
+        pytest.skip("run crop_study.py --elementwise first")
+    import onnx
+
+    big, small = large_elementwise_nodes(src)
+    assert big and small, (len(big), len(small))
+
+    m = onnx.shape_inference.infer_shapes(onnx.load(str(src)))
+    sizes = {}
+    for vi in list(m.graph.value_info) + list(m.graph.output):
+        dims = [d.dim_value if d.dim_value > 0 else 1 for d in vi.type.tensor_type.shape.dim]
+        sizes[vi.name] = int(np.prod(dims)) if dims else 0
+    out_of = {n.name: sizes.get(n.output[0], 0) for n in m.graph.node}
+    cutoff = max(sizes.values()) / 4.0
+    assert all(out_of[n] > cutoff for n in big)
+    assert all(out_of[n] <= cutoff for n in small)
+
+
+@pytest.mark.parametrize("name", ["crop1s_int8_d0.onnx", "crop1s_int8_d2.onnx"])
+def test_elementwise_quantized_graph_still_has_gradients(name):
+    """The failure this guards against is silent: the graph loads, runs, and
+    returns a gradient of exactly zero."""
+    import onnxruntime as ort
+
+    ew = CROP1S_EW / name
+    if not ew.exists():
+        pytest.skip("run crop_study.py --elementwise first")
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 1
+    sess = ort.InferenceSession(str(ew), so, providers=["CPUExecutionProvider"])
+    n = int(np.prod([d for d in sess.get_inputs()[0].shape if isinstance(d, int)]))
+    rng = np.random.default_rng(0)
+    t = np.arange(n) / 16000.0
+    wav = (0.3 * np.sin(2 * np.pi * 220 * t) + 0.05 * rng.standard_normal(n)).astype(np.float32)
+    g = sess.run(None, {"wav": wav[None], "w": np.array([0, 0, -1], np.float32)})[2]
+    assert np.isfinite(g).all()
+    assert np.linalg.norm(g) > 1e-3, "elementwise quantization zeroed the gradient"
+
+
+def test_elementwise_quantization_cuts_the_activation_peak():
+    import budget
+
+    base, ew = CROP1S / "crop1s_int8_d2.onnx", CROP1S_EW / "crop1s_int8_d2.onnx"
+    if not (base.exists() and ew.exists()):
+        pytest.skip("run crop_study.py with and without --elementwise first")
+    peak_base = budget.peak_activation(base, fused_qdq=True)[0]
+    peak_ew = budget.peak_activation(ew, fused_qdq=True)[0]
+    assert peak_ew * 4 <= peak_base, (peak_base, peak_ew)
+    assert peak_ew <= 2.8 * 1024 * 1024, peak_ew

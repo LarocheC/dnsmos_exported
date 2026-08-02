@@ -88,13 +88,21 @@ _ELEM_BYTES = {
 }
 
 
-def peak_activation(model_path: Path):
+def peak_activation(model_path: Path, fused_qdq: bool = False):
     """Largest live intermediate tensor: (bytes, name, dims, dtype).
 
     Uses each tensor's REAL dtype — a QDQ int8 graph still carries fp32
     tensors wherever nodes were excluded from quantization, and charging
     1 byte/element there understates the peak fourfold. Dequantized *weights*
     are excluded: they are persistent parameters, not activations.
+
+    `fused_qdq` reports what a backend that FUSES Q/DQ into its neighbours
+    materializes, which is what ST Edge AI does and what decides the on-chip
+    fit. In QDQ format the graph is nominally all-float with Q/DQ pairs
+    marking quantized regions, so a float tensor produced by a DequantizeLinear
+    (or consumed only by a QuantizeLinear) never exists as float on such a
+    target. ORT CPU does materialize it, hence the two numbers — report both,
+    and never quote the fused one as measured on target.
     """
     m = onnx.shape_inference.infer_shapes(onnx.load(str(model_path)))
     inits = {t.name for t in m.graph.initializer}
@@ -112,13 +120,29 @@ def peak_activation(model_path: Path):
             cur = node.input[0]
         return False
 
+    consumers = {}
+    for n in m.graph.node:
+        for i in n.input:
+            consumers.setdefault(i, []).append(n)
+
+    def in_quantized_region(name: str) -> bool:
+        """A float tensor a QDQ-fusing backend never materializes as float."""
+        prod = producers.get(name)
+        if prod is not None and prod.op_type == "DequantizeLinear":
+            return True
+        cons = consumers.get(name, [])
+        return bool(cons) and all(c.op_type == "QuantizeLinear" for c in cons)
+
     best = (0, "", [], 0)
     for vi in list(m.graph.value_info) + list(m.graph.output):
         dims = [d.dim_value if d.dim_value > 0 else 1 for d in vi.type.tensor_type.shape.dim]
         if not dims or is_weight(vi.name):
             continue
         et = vi.type.tensor_type.elem_type
-        nbytes = int(np.prod(dims)) * _ELEM_BYTES.get(et, 4)
+        width = _ELEM_BYTES.get(et, 4)
+        if fused_qdq and et == onnx.TensorProto.FLOAT and in_quantized_region(vi.name):
+            width = 1
+        nbytes = int(np.prod(dims)) * width
         if nbytes > best[0]:
             best = (nbytes, vi.name, dims, et)
     return best

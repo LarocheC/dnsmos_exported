@@ -276,6 +276,9 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=30)
     ap.add_argument("--threads", type=int, default=1,
                     help="ORT intra-op threads; 1 makes the int8 numbers reproducible")
+    ap.add_argument("--elementwise", action="store_true",
+                    help="also quantize the peak-setting Mul/Sub of the backward "
+                         "(4x smaller activation peak; needed to fit n6-noextmem)")
     ap.add_argument("--skip-loop", action="store_true")
     args = ap.parse_args()
 
@@ -323,16 +326,23 @@ def main() -> None:
                    for c in calib]
 
     print(f"\nint8 QDQ ladder (calibrated on {len(calib)} real VBD clips, MinMax, "
-          f"{args.threads} ORT thread{'s' if args.threads != 1 else ''}):")
+          f"{args.threads} ORT thread{'s' if args.threads != 1 else ''}"
+          f"{', elementwise quantized' if args.elementwise else ''}):")
     results = {}
     for depth in args.ladder:
         out = quantize_qdq(pre, args.out_dir / f"{tag}_int8_d{depth}.onnx", calib_feeds,
-                           extra_exclude=bwd_convs[:depth], preprocessed=True)
+                           extra_exclude=bwd_convs[:depth], preprocessed=True,
+                           quantize_elementwise=args.elementwise)
         rep = grad_cosines(fp32, out, evalc, threads=args.threads)
         results[depth] = (out, rep)
+        import budget
+
+        pk_ort = budget.peak_activation(out)[0] / 2**20
+        pk_fused = budget.peak_activation(out, fused_qdq=True)[0] / 2**20
         print(f"  exclude={depth} bwd convs  {out.stat().st_size/1e6:5.2f} MB  "
               f"cos_mean {rep['cosine_mean']:.3f}  cos_min {rep['cosine_min']:.3f}  "
-              f"|g8|/|g32| {rep['ratio_mean']:.2f}")
+              f"|g8|/|g32| {rep['ratio_mean']:.2f}  peak {pk_ort:.2f}M ort / "
+              f"{pk_fused:.2f}M fused")
 
     print("\nreproducibility of the gradient itself (why --threads matters):")
     determinism_probe(fp32, results[args.ladder[0]][0], evalc)

@@ -80,6 +80,9 @@ def main() -> None:
                     default=HERE.parents[1] / "models" / "sig_bak_ovr.onnx")
     ap.add_argument("--demo-artifacts", type=Path, default=HERE / "artifacts")
     ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--arms", type=str, default=None,
+                    help="comma-separated substrings; run only matching arms "
+                         "(the first one kept becomes the paired reference)")
     ap.add_argument("--out", type=Path, default=HERE / "artifacts" / "adaptation_eval.npz")
     args = ap.parse_args()
 
@@ -87,6 +90,7 @@ def main() -> None:
     # effect is known to be large and negative, so if the protocol cannot
     # separate it from the rest, the protocol is broken.
     A2, A1, AD = HERE / "artifacts_crop", HERE / "artifacts_crop1s", HERE / "artifacts"
+    A1EW = HERE / "artifacts_crop1s_ew"
     candidates = [
         ("fp32 2 s crop",      A2 / "crop2s_fp32.onnx",    2.0),
         ("int8 2 s, excl 0",   A2 / "crop2s_int8_d0.onnx", 2.0),
@@ -94,8 +98,17 @@ def main() -> None:
         ("fp32 1 s crop",      A1 / "crop1s_fp32.onnx",    1.0),
         ("int8 1 s, excl 0",   A1 / "crop1s_int8_d0.onnx", 1.0),
         ("int8 1 s, excl 2",   A1 / "crop1s_int8_d2.onnx", 1.0),
+        ("int8 1 s ew, excl 0", A1EW / "crop1s_int8_d0.onnx", 1.0),
+        ("int8 1 s ew, excl 2", A1EW / "crop1s_int8_d2.onnx", 1.0),
         ("distilled student",  AD / "dnsmos_student_loss.onnx", None),
     ]
+    if args.arms:
+        keep = [a.strip() for a in args.arms.split(",")]
+        unknown = [k for k in keep if not any(k in lab for lab, _, _ in candidates)]
+        if unknown:
+            raise SystemExit(f"no arm matches {unknown}; known: "
+                             f"{[lab for lab, _, _ in candidates]}")
+        candidates = [c for c in candidates if any(k in c[0] for k in keep)]
     arms = [(lab, p, w) for lab, p, w in candidates if p.exists()]
     missing = [lab for lab, p, _ in candidates if not p.exists()]
     if missing:
