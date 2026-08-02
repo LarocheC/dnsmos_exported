@@ -90,6 +90,19 @@ deployed int8 DNSMOS OVRL: 2.319
 The head learns a frequency-selective gain from scratch, driven only by
 gradients that came out of an inference graph.
 
+**Is the SI-SNR anchor doing anything?** At the default `--sisnr-floor 6` the
+hinge never engages in 60 steps — SI-SNR settles at 15.9 dB on its own, so
+nothing needs constraining. Raising the floor shows the anchor is functional
+rather than decorative:
+
+```
+--sisnr-floor 25 :  OVRL 1.329 -> 2.173   SI-SNR pinned at 25.4-26.4 dB
+--sisnr-floor  6 :  OVRL 1.329 -> 2.342   SI-SNR drifts to 15.9 dB
+```
+
+The hinge binds exactly when asked to and still permits most of the DNSMOS
+gain. Set the floor to whatever distortion budget your deployment tolerates.
+
 **Read this honestly.** The trunk is random here because the published
 ConvFSENet weights are in a gated HuggingFace repo. This demonstrates that the
 *mechanism* is correct and effective, not that it improves a well-trained
