@@ -19,8 +19,13 @@ Steps:
      cropped graph's gradients, then score the result with the OFFICIAL model
 
 Step 5 answers "can you train with a quantized DNSMOS?" -- correlation and
-cosine do not. (Measured at a 2 s window: yes, retaining ~70% of the fp32
-crop's true-metric gain. See FEASIBILITY.md 5b.)
+cosine do not. (Yes: over 420 paired adaptations it retains 83-86% of the fp32
+crop's true-metric gain. See FEASIBILITY.md 5b/5d.)
+
+NOTE: this script's own ΔOVRL line is a SINGLE clip -- a smoke test, not a
+measurement. Its noise floor is comparable to the differences between the
+int8 ladder rungs, and it has ranked them wrongly. Use adaptation_eval.py for
+anything you intend to conclude from.
 
 Needs the VoiceBank-DEMAND cache that validate_student.py writes.
 

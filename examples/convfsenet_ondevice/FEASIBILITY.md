@@ -1,16 +1,20 @@
 # How small must it be to train on-chip in real time?
 
-Reproduce with `python explore_feasibility.py`, `python validate_student.py`
-and `python crop_study.py`.
+Reproduce with `python explore_feasibility.py`, `python validate_student.py`,
+`python crop_study.py` and — for anything with error bars — `python
+adaptation_eval.py`.
 
 **Short answer.** Memory and compute are the easy part — plenty of configurations
 fit, and the enhancer is not the bottleneck. The binding constraint is something
 the arithmetic does not show: a distilled DNSMOS proxy small enough to fit is
 *exploited by the very optimizer it is meant to guide*, and makes the true
 metric worse. Fixing that, not shrinking further, is the critical path. The fix
-is to stop shrinking the model and shrink the *window* instead — a 2 s crop of
-the official weights steers better than anything else tested, and survives int8
-quantization at about 70 % efficiency (§5, §5b).
+is to stop shrinking the model and shrink the *window* instead: cropping the
+official weights keeps the gradient field intact. Over 420 measured adaptations
+(§5d), a **1 s crop, int8** improves the true metric on 100 % of clips by
++0.385 [+0.329, +0.452], is statistically indistinguishable from the 2 s crop
+at half the cost, and is the only official-weight configuration that fits the
+on-chip pool. The distilled student, on the same clips, is −0.175.
 
 ---
 
@@ -133,7 +137,8 @@ field intact:
 | 1.00 s | 1.95 MB | 4.3 | 0.734 | 0.255 |
 | 0.50 s | 0.96 MB | 2.1 | 0.193 | 0.113 |
 
-Functionally, on the same clip and protocol as the student:
+Functionally, on the same clip and protocol as the student (single-clip
+figures — see §5d for the same comparison with error bars):
 
 | gradient source | ΔTRUE OVRL |
 |---|---:|
@@ -144,29 +149,31 @@ Functionally, on the same clip and protocol as the student:
 A 2 s crop of the real model is 4.5× cheaper than the full one, fits the compute
 budget (8.6 of 2.2–15.7 GMAC), and steers *better* than either alternative.
 
-## 5b. Does it survive int8? Yes — at about 70 % efficiency
+## 5b. Does it survive int8? Yes — at 83 % efficiency
 
 The crop above is fp32. Quantizing it (`crop_study.py`, QDQ int8, MinMax,
 calibrated on 8 real VBD clips) with an exclusion ladder over the deepest
-backward convs:
+backward convs. ΔOVRL is the paired multi-clip number from §5d, not the
+single-clip one this script prints:
 
-| int8 variant | size | grad cos vs its own fp32 | ‖g₈‖/‖g₃₂‖ | ΔTRUE OVRL |
+| int8 variant | size | grad cos vs its own fp32 | ‖g₈‖/‖g₃₂‖ | ΔTRUE OVRL (n=60) |
 |---|---:|---:|---:|---:|
-| fp32 2 s crop | 1.99 MB | 1.000 | 1.00 | **+0.475** |
-| int8, exclude 0 bwd convs | 0.98 MB | 0.440 | 0.51 | **+0.327** |
-| int8, exclude 1 | 0.98 MB | 0.469 | 0.57 | +0.181 |
-| int8, exclude 2 | 1.20 MB | 0.499 | 0.54 | +0.287 |
+| fp32 2 s crop | 1.99 MB | 1.000 | 1.00 | **+0.460** |
+| int8, exclude 0 bwd convs | 0.98 MB | 0.440 | 0.51 | +0.355 |
+| int8, exclude 2 | 1.20 MB | 0.499 | 0.54 | **+0.381** |
 
-**Training with a quantized DNSMOS works**: the fully-quantized graph retains
-69 % of the fp32 crop's true-metric gain, and every variant beats both the
-distilled student (−0.178) and the full fp32 9.01 s model (+0.151).
+**Training with a quantized DNSMOS works**: the quantized graph retains 83 % of
+the fp32 crop's true-metric gain, improves the true metric on 100 % of clips,
+and beats the distilled student (−0.175) by 0.56 MOS.
 
 Two things in that table are worth more than the headline:
 
-- **Excluding convs from quantization raises cosine and does *not* raise
-  ΔOVRL.** Cosine ranks `exclude=2` first; the metric ranks `exclude=0` first.
-  Same lesson as §5 one level down — agreement with a reference gradient is not
-  steering quality. Pick the ladder rung by the functional number.
+- **Holding the two deepest backward convs in float is worth +0.027 MOS**
+  (paired, 95 % CI [+0.011, +0.042]) for 0.22 MB. Cosine ranks the ladder the
+  same way, so here the cheap proxy happens to agree with the metric — unlike
+  §4, where cosine 0.0002 sat next to Spearman 0.84. Note that the single-clip
+  run ranked these two rungs the *other* way; that ranking was noise, and it is
+  why §5d exists.
 - **The int8 gradient is not a function of its input.** Rerunning the same
   graph on the same audio across fresh sessions and thread counts, 5–50 % of
   executions diverge — the rate climbs with machine load, because thread
@@ -206,48 +213,78 @@ the published tensors — so the on-chip frontier is set purely by frames:
 So there are two deployable targets, not one: the 2 s crop in PSRAM, or the
 1 s crop on-chip (§5c).
 
-## 5c. The 1 s crop — and why the protocol has run out of resolution
+## 5c. The 1 s crop, and the protocol running out of resolution
 
-`python crop_study.py --window-s 1.0`, same protocol, same clip:
+Measured at 1 s, `crop_study.py` said the int8 build beat its own fp32 build by
+17 % (+0.328 vs +0.281). Quantization cannot improve the gradient it
+approximates, so that was a sign the **single-clip, single-seed, 30-step
+protocol had a noise floor comparable to the effects it was ranking**. It did.
+Everything in §5d supersedes the single-clip numbers; §5b's ladder ranking was
+one of the casualties.
 
-| gradient source | grad cos vs fp32 | ΔTRUE OVRL |
-|---|---:|---:|
-| fp32 1 s crop | 1.000 | +0.281 |
-| int8 1 s, exclude 0 | 0.351 | +0.168 |
-| int8 1 s, exclude 1 | 0.357 | +0.180 |
-| int8 1 s, exclude 2 | 0.357 | **+0.328** |
+## 5d. With error bars
 
-Read literally: the 1 s crop matches the 2 s crop (+0.328 vs +0.327), fits the
-on-chip pool, and its int8 build beats its own fp32 build by 17 %.
+`adaptation_eval.py`: 7 gradient sources × 30 clips × 2 head initializations =
+420 adaptations, every arm on the identical (clip, init) list.
 
-That last claim is not believable, and it is the useful part of this table.
-Quantization cannot improve the gradient it approximates; a +0.328-vs-+0.281
-gap in that direction is noise. **The single-clip, single-seed, 30-step
-protocol has a noise floor comparable to the effects it is being used to
-rank** — which means §5b's choice of ladder rung, and the 2 s-vs-1 s choice
-here, are both currently unresolved.
+| gradient source | mean ΔTRUE OVRL | sd | 95 % CI | clips improved |
+|---|---:|---:|---:|---:|
+| **fp32 2 s crop** | **+0.460** | 0.139 | [+0.426, +0.495] | 100 % |
+| int8 2 s, exclude 2 | +0.381 | 0.141 | [+0.346, +0.418] | 100 % |
+| int8 2 s, exclude 0 | +0.355 | 0.148 | [+0.318, +0.393] | 100 % |
+| fp32 1 s crop | +0.446 | 0.231 | [+0.394, +0.507] | 100 % |
+| int8 1 s, exclude 2 | +0.385 | 0.247 | [+0.329, +0.452] | 100 % |
+| int8 1 s, exclude 0 | +0.347 | 0.178 | [+0.305, +0.393] | 100 % |
+| distilled student | **−0.175** | 0.310 | [−0.257, −0.105] | **23 %** |
 
-Everything measured so far survives this: −0.178 (student) vs +0.15…+0.49
-(real weights) is far outside the noise, and that comparison is what the
-project turned on. But the remaining decisions are inside it. The next
-measurement to make is the same adaptation over 20–40 clips with error bars,
-before any more design conclusions are drawn from it.
+Paired against the fp32 2 s crop — same clips, same inits, so the clip-to-clip
+spread cancels:
+
+| | mean diff | 95 % CI | |
+|---|---:|---:|---|
+| fp32 1 s crop | −0.014 | [−0.067, +0.044] | **indistinguishable** |
+| int8 2 s, exclude 2 | −0.079 | [−0.102, −0.055] | worse, resolvably |
+| int8 1 s, exclude 2 | −0.075 | [−0.135, −0.009] | worse, resolvably |
+| distilled student | −0.635 | [−0.718, −0.561] | worse, enormously |
+
+What this settles:
+
+- **int8 costs 0.08 MOS, and that cost is real** — the CI excludes zero, where
+  the single clip could not tell. Retention is 83 % (2 s) and 86 % (1 s), not
+  the 69 % the single clip suggested.
+- **Halving the window costs nothing measurable.** −0.014 [−0.067, +0.044] in
+  fp32, +0.004 [−0.055, +0.070] in int8. The 1 s crop is half the memory and
+  half the MACs for no detectable quality loss — and it is the one that fits
+  on-chip.
+- **The student result was never noise.** −0.175, and it makes 77 % of clips
+  *worse*; every real-weight arm improves 100 % of them. That was always the
+  finding the project turned on, and 60 pairs confirm it at 0.56 MOS of
+  separation.
+- **The ladder ranking flipped.** With one clip, `exclude=0` looked best; with
+  60 pairs, `exclude=2` is better by +0.027 [+0.011, +0.042]. §5b now reflects
+  the paired number.
+
+One confound is not settled and should not be read past. The official judge
+needs 9.01 s, so a shorter crop is tiled up to it — 4.5× for the 2 s arms, 9×
+for the 1 s arms. **Within-window comparisons are clean** (both arms hand the
+judge an identically-built signal); the 1 s-vs-2 s rows confound window length
+with tiling. Settling that means scoring the learned mask applied to the full
+clip, which also tests whether adaptation on a short window generalizes off it.
 
 ## 6. Recommendation
 
-1. **Do not distill a student.** Crop the window on the official weights
-   instead — that conclusion is well outside the noise (§4, §5). Two crops are
-   deployable and the choice between them is a memory decision, not yet a
-   quality one:
-   - **2 s, int8** — 8.6 GMAC, +0.327 true OVRL, 3.91 MB peak once the
-     elementwise ops are quantized. **PSRAM part** (N6570-DK).
-   - **1 s, int8** — 4.3 GMAC, +0.328 measured (same, within noise), 1.95 MB
-     peak. **The only official-weight configuration that fits the 2.8 MB
-     `n6-noextmem` pool.**
+1. **Ship the 1 s crop of the official weights, int8 QDQ, `exclude=2`.**
+   4.3 GMAC, 1.20 MB of weights, **+0.385 true OVRL [+0.329, +0.452]**,
+   improves 100 % of clips, passes the STM32N6 lint, and at a 1.95 MB
+   activation peak it is **the only official-weight configuration that fits
+   the 2.8 MB `n6-noextmem` pool** (once the elementwise ops are quantized —
+   next-steps item 1). The 2 s crop is statistically indistinguishable from it
+   (−0.014 [−0.067, +0.044]) and costs 2× the memory and MACs, so it is only
+   worth taking if you have PSRAM anyway and the §5d tiling confound resolves
+   in its favour.
 
-   Both export cleanly and pass the STM32N6 lint at 0.98 MB of weights. Take
-   the 1 s crop unless a multi-clip evaluation (§5c) shows the 2 s window
-   actually buys something.
+   **Do not distill a student.** −0.175, worse on 77 % of clips, 0.56 MOS
+   behind the crop.
 2. **MetricGAN is not needed for this problem, but is still the answer to the
    next one.** On-policy refresh fixes proxy *drift*; it does not create a
    gradient field that was never there. Once you are steering with real
@@ -258,11 +295,13 @@ before any more design conclusions are drawn from it.
 3. **Keep the SI-SNR anchor and make it tight.** It is what stops both the
    proxy and the true metric from being gamed; in the runs above the mask
    reaches 0.05 (near-total gating of some bins) before the anchor engages.
-4. **Validate against the true metric, never the proxy.** `validate_student.py`
-   step 6 and `crop_study.py`'s adaptation table are the only numbers that mean
-   anything. Neither correlation (§4) nor gradient cosine (§5b) ranks the
-   options correctly — in both sections the agreement metric picks a different
-   winner than the metric does.
+4. **Validate against the true metric, never the proxy, and with error bars.**
+   Correlation is actively misleading (§4: Spearman 0.84, cosine 0.0002, true
+   effect negative). Gradient cosine happens to rank the int8 ladder correctly
+   (§5b) but nothing guarantees that — it is the paired ΔOVRL that decided it.
+   And a single clip cannot rank anything here: it got the ladder backwards and
+   produced an int8 build that "beat" fp32 (§5c). `adaptation_eval.py` is the
+   instrument; treat `crop_study.py`'s own ΔOVRL line as a smoke test.
 5. **Shrink the enhancer for quality/power reasons only** — it is not what
    limits on-device training.
 6. **Use an averaging optimizer with the int8 graph.** Its gradient is
@@ -271,17 +310,18 @@ before any more design conclusions are drawn from it.
 
 ### What to do next, in order
 
-1. **Give the adaptation test error bars** (20–40 clips, several seeds).
-   Nothing else on this list can be decided until it exists — §5c shows the
-   current protocol cannot separate the options it is being asked to rank.
-2. **Quantize the elementwise backward ops.** `op_types_to_quantize` covers
-   only Conv/Gemm/MatMul today, which is a 4× penalty on the single largest
-   tensor. Required for either target: 15.64 → 3.91 MB at 2 s, 7.78 → 1.95 MB
-   at 1 s (the on-chip one).
-3. **Replace the MAC model with on-target numbers.** `stedgeai validate
-   --mode target` on `crop1s_fp32_stm32n6.onnx` / its int8 build. Every
+1. **Quantize the elementwise backward ops.** `op_types_to_quantize` covers
+   only Conv/Gemm/MatMul today, a 4× penalty on the single largest tensor.
+   This is what makes the recommended 1 s crop actually fit on-chip:
+   7.78 → 1.95 MB. Without it there is no `n6-noextmem` build.
+2. **Replace the MAC model with on-target numbers.** `stedgeai validate
+   --mode target` on `crop1s_fp32_stm32n6.onnx` and its int8 build. Every
    latency figure in this document is MAC-derived, and the 2.2–15.7 GMAC
    budget that gates the whole design rests on it.
+3. **Close the tiling confound** (§5d) by scoring the learned mask on the full
+   9.01 s clip rather than a tiled crop. It decides 1 s vs 2 s properly and
+   answers a better question — whether adapting on a short window generalizes
+   off it.
 4. **Then co-training** (item 2 above). It answers metric-hacking, which only
    becomes the live risk once the steering signal is settled.
 
@@ -289,18 +329,19 @@ before any more design conclusions are drawn from it.
 
 - The ConvFSENet trunk here is randomly initialized (the published weights are
   gated), so absolute deltas are not representative of adapting a trained
-  enhancer. The *relative* comparison — full model +0.151 vs student −0.178
-  under identical conditions — is the meaningful part, and the exploitation
-  trace is independent of the trunk.
+  enhancer. The *relative* comparisons are the meaningful part, and they are
+  all paired against a common reference under identical conditions.
 - Timing is MAC-derived from eco8's measured throughput span, not measured on
   target. Only `stedgeai validate --mode target` / `npu_profiler.py` settle it.
-- Adaptation deltas are single-clip, single-seed, 30-step — a noise floor
-  comparable to the differences between the int8 variants (§5c). Treat the
-  student-vs-real-weights gap as established and every finer ranking as
-  provisional. The loop also runs the int8
-  ConvFSENet trunk, which carries the same intermittent nondeterminism as §5b.
-  `crop_study.py` pins `--threads 1` and reproduces its table exactly run to
-  run; the §4/§5 rows predate that pin and move by ~0.02 OVRL without it.
+- §5d carries error bars; **§1–§5c do not** — their ΔOVRL figures are
+  single-clip and, as §5c shows, at or below the noise floor. Where the two
+  disagree, §5d wins. The 30-step budget and the lr=3e-3 Adam schedule are
+  fixed across all arms but were never tuned; a different budget could reorder
+  arms that §5d calls indistinguishable.
+- The adaptation loop runs the int8 ConvFSENet trunk, which carries the same
+  intermittent nondeterminism as §5b. `crop_study.py` and `adaptation_eval.py`
+  both pin `--threads 1`; the §4/§5 rows predate that pin and move by ~0.02
+  OVRL without it.
 - Students were trained for 400 steps on 120 clips. More data would raise
   correlation; whether it removes the exploitation is exactly the open question,
   and correlation alone will not tell you.
