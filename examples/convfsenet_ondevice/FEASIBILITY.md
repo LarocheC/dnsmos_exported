@@ -10,11 +10,11 @@ the arithmetic does not show: a distilled DNSMOS proxy small enough to fit is
 *exploited by the very optimizer it is meant to guide*, and makes the true
 metric worse. Fixing that, not shrinking further, is the critical path. The fix
 is to stop shrinking the model and shrink the *window* instead: cropping the
-official weights keeps the gradient field intact. Over 420 measured adaptations
-(§5d), a **1 s crop, int8** improves the true metric on 100 % of clips by
-+0.385 [+0.329, +0.452], is statistically indistinguishable from the 2 s crop
-at half the cost, and is the only official-weight configuration that fits the
-on-chip pool. The distilled student, on the same clips, is −0.175.
+official weights keeps the gradient field intact. Over 660 measured adaptations
+(§5d, §5e), a **1 s crop, int8, elementwise-quantized** improves the true
+metric on 100 % of clips by +0.340 [+0.295, +0.386] and fits the 2.8 MB
+on-chip pool. The distilled student, on the same clips, is −0.175 and makes
+77 % of them worse.
 
 ---
 
@@ -271,20 +271,69 @@ judge an identically-built signal); the 1 s-vs-2 s rows confound window length
 with tiling. Settling that means scoring the learned mask applied to the full
 clip, which also tests whether adaptation on a short window generalizes off it.
 
+## 5e. Getting it on-chip: quantizing the backward's elementwise tail
+
+Everything above still needed PSRAM, because the activation peak was fp32.
+`relu_mask` materializes `Equal → Cast → Sub → Mul` at conv1's full size, and
+none of those are in ORT's QDQ registry — so the largest tensor in the graph
+was carried at 4 bytes/element. That is not an ORT accounting artifact: those
+tensors sit outside any Q/DQ region, so a QDQ-*fusing* backend materializes
+them as float too.
+
+ORT will quantize `Mul`/`Sub` if they are registered against `QDQOperatorBase`,
+but doing it wholesale is a trap. Gradient norm on the 1 s crop, against 11.07
+for the unquantized-elementwise baseline:
+
+| registered | ‖g‖ | |
+|---|---:|---|
+| `+Sub` | 11.07 | harmless |
+| `+Add` | 0.54 | severe degradation |
+| **`+Mul`** | **0.00** | **destroys the gradient outright** |
+
+`Mul` is simultaneously the op that matters for memory and the one that
+silently zeroes the gradient. `large_elementwise_nodes` therefore quantizes
+only the nodes that *set* the peak — output larger than `peak/4`, 6 of 45 here
+— and leaves the small Muls carrying the surviving gradient in float, where
+they cost nothing.
+
+| 1 s crop, int8, exclude 2 | activation peak (fused) | ΔTRUE OVRL (n=60) |
+|---|---:|---:|
+| elementwise in float | 7.78 MB — **PSRAM** | +0.397 [+0.344, +0.458] |
+| **elementwise quantized** | **1.95 MB — fits `n6-noextmem`** | **+0.340 [+0.295, +0.386]** |
+
+The 4× memory win costs **−0.057 MOS** (paired, [−0.095, −0.023] — resolvable,
+not noise). It is a trade, not a free lunch: you are buying the on-chip build
+with about an eighth of the fp32 crop's headroom. The quantized artifact still
+improves 100 % of clips and retains 76 % of the fp32 1 s crop, and the
+rows-layout export passes the STM32N6 lint at 1.47 MB of weights.
+
+Two accounting notes, because they are easy to quote wrongly:
+
+- **ORT's peak stays 7.78 MB.** ORT CPU materializes the float tensors between
+  Q/DQ pairs; a fusing backend does not. `budget.peak_activation` reports both,
+  and only the fused number decides the on-chip fit. It is analytic —
+  `stedgeai validate --mode target` is what would confirm it.
+- Once both of a MatMul's inputs are quantized, ORT fuses `DQ+DQ+MatMul` into
+  `QLinearMatMul` at session load and then rejects the per-channel weight
+  zero-point. That is an ORT CPU kernel limit, not a defect in the exported
+  graph, but it is why these artifacts use per-node exclusion.
+
 ## 6. Recommendation
 
 1. **Ship the 1 s crop of the official weights, int8 QDQ, `exclude=2`.**
-   4.3 GMAC, 1.20 MB of weights, **+0.385 true OVRL [+0.329, +0.452]**,
-   improves 100 % of clips, passes the STM32N6 lint, and at a 1.95 MB
-   activation peak it is **the only official-weight configuration that fits
-   the 2.8 MB `n6-noextmem` pool** (once the elementwise ops are quantized —
-   next-steps item 1). The 2 s crop is statistically indistinguishable from it
-   (−0.014 [−0.067, +0.044]) and costs 2× the memory and MACs, so it is only
-   worth taking if you have PSRAM anyway and the §5d tiling confound resolves
-   in its favour.
+   4.3 GMAC, improves 100 % of clips, passes the STM32N6 lint. Pick the
+   variant by which memory you have:
+   - **on-chip** (`--elementwise`): 1.95 MB fused peak, fits the 2.8 MB
+     `n6-noextmem` pool. **+0.340 [+0.295, +0.386]**, 1.47 MB of weights.
+   - **PSRAM**: 7.78 MB peak, +0.397 [+0.344, +0.458], 1.21 MB of weights.
+     Worth +0.057 MOS if you have the memory anyway.
 
-   **Do not distill a student.** −0.175, worse on 77 % of clips, 0.56 MOS
-   behind the crop.
+   The 2 s crop is statistically indistinguishable from the 1 s one
+   (−0.014 [−0.067, +0.044]) at 2× the memory and MACs, so take it only if the
+   §5d tiling confound resolves in its favour.
+
+   **Do not distill a student.** −0.175, worse on 77 % of clips, 0.5 MOS
+   behind every crop variant.
 2. **MetricGAN is not needed for this problem, but is still the answer to the
    next one.** On-policy refresh fixes proxy *drift*; it does not create a
    gradient field that was never there. Once you are steering with real
@@ -310,18 +359,19 @@ clip, which also tests whether adaptation on a short window generalizes off it.
 
 ### What to do next, in order
 
-1. **Quantize the elementwise backward ops.** `op_types_to_quantize` covers
-   only Conv/Gemm/MatMul today, a 4× penalty on the single largest tensor.
-   This is what makes the recommended 1 s crop actually fit on-chip:
-   7.78 → 1.95 MB. Without it there is no `n6-noextmem` build.
-2. **Replace the MAC model with on-target numbers.** `stedgeai validate
-   --mode target` on `crop1s_fp32_stm32n6.onnx` and its int8 build. Every
-   latency figure in this document is MAC-derived, and the 2.2–15.7 GMAC
-   budget that gates the whole design rests on it.
-3. **Close the tiling confound** (§5d) by scoring the learned mask on the full
+1. **Confirm the memory on target.** `stedgeai validate --mode target` on
+   `crop1s_int8_stm32n6.onnx`. The 1.95 MB peak is analytic and assumes the
+   compiler fuses Q/DQ — true of Neural-ART, but the whole on-chip claim rests
+   on it. The same run replaces the MAC-derived latency model, which the
+   2.2–15.7 GMAC budget also rests on.
+2. **Close the tiling confound** (§5d) by scoring the learned mask on the full
    9.01 s clip rather than a tiled crop. It decides 1 s vs 2 s properly and
    answers a better question — whether adapting on a short window generalizes
    off it.
+3. **Recover some of the −0.057.** The elementwise cost (§5e) comes from
+   quantizing 6 nodes with one global calibration; per-node range selection,
+   or holding the mask path in float while quantizing only the gradient
+   tensors, are both untried.
 4. **Then co-training** (item 2 above). It answers metric-hacking, which only
    becomes the live risk once the steering signal is settled.
 
@@ -333,11 +383,16 @@ clip, which also tests whether adaptation on a short window generalizes off it.
   all paired against a common reference under identical conditions.
 - Timing is MAC-derived from eco8's measured throughput span, not measured on
   target. Only `stedgeai validate --mode target` / `npu_profiler.py` settle it.
-- §5d carries error bars; **§1–§5c do not** — their ΔOVRL figures are
+- §5d/§5e carry error bars; **§1–§5c do not** — their ΔOVRL figures are
   single-clip and, as §5c shows, at or below the noise floor. Where the two
-  disagree, §5d wins. The 30-step budget and the lr=3e-3 Adam schedule are
-  fixed across all arms but were never tuned; a different budget could reorder
-  arms that §5d calls indistinguishable.
+  disagree, the paired numbers win. The 30-step budget and the lr=3e-3 Adam
+  schedule are fixed across all arms but were never tuned; a different budget
+  could reorder arms that §5d calls indistinguishable.
+- Those CIs cover clip and initialization sampling, **not** execution
+  nondeterminism. Re-running an identical int8 arm moved its mean by 0.012
+  (+0.385 → +0.397) — small against a ±0.06 interval, and it does not reorder
+  anything, but int8 arms carry that on top. Do not run the eval under
+  concurrent load; §5b's divergence rate climbs with it.
 - The adaptation loop runs the int8 ConvFSENet trunk, which carries the same
   intermittent nondeterminism as §5b. `crop_study.py` and `adaptation_eval.py`
   both pin `--threads 1`; the §4/§5 rows predate that pin and move by ~0.02

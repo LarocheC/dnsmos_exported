@@ -142,9 +142,11 @@ Compute             trunk 1,094 MMAC + head 55 MMAC + DNSMOS 38,823 MMAC
 
 **The full-size DNSMOS loss graph does not fit the STM32N6 — not even with the
 DK's 32 MB PSRAM.** A single live activation is 70.75 MB: DNSMOS's first
-convolution expands a 900×161 spectrogram to 128 channels, and the backward
-tail nodes held out of quantization (to protect gradient quality) carry that
-tensor in **fp32**, at 128 × 900 × 161 × 4 B. The int8 body is not the problem.
+convolution expands a 900×161 spectrogram to 128 channels, and the backward's
+elementwise tail — `Equal → Cast → Sub → Mul`, none of which ORT quantizes by
+default — carries that tensor in **fp32**, at 128 × 900 × 161 × 4 B. The int8
+body is not the problem. Both halves of that are fixable and both matter: the
+window sets the tensor's size, and `--elementwise` sets its dtype.
 
 Shrinking DNSMOS is therefore a **requirement** for this target, not an
 optimization — but *how* you shrink it decides the project.
@@ -155,8 +157,14 @@ distilled student small enough to fit reaches OVRL Spearman 0.84 against the
 official model and still gets *exploited* by the optimizer, making the true
 metric **worse on 77 % of clips** (−0.175 over 60 measured adaptations).
 Cropping the window on the **official weights** instead costs nothing to build
-and improves the true metric on **100 %** of them (+0.385 [+0.329, +0.452] for
-a 1 s int8 crop). Memory is not the hard part; keeping the proxy honest is.
+and improves the true metric on **100 %** of them. Memory is not the hard part;
+keeping the proxy honest is.
+
+The deployable result is a **1 s window crop of the published weights, int8
+QDQ with the backward's peak-setting elementwise ops quantized**: a 1.95 MB
+activation peak that fits the 2.8 MB `n6-noextmem` pool, passing the STM32N6
+lint, at +0.340 [+0.295, +0.386] true OVRL. Build it with
+`python crop_study.py --window-s 1.0 --elementwise`.
 
 The enhancer half is 7.57 MB — also above the 2.8 MB `n6-noextmem` pools, but
 that is dominated by the 5.01 MB of 9.01 s working buffers, which scale down
