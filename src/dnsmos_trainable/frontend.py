@@ -14,7 +14,9 @@ directly: numerically identical forward, and gradient-safe (no sqrt at 0).
 import torch
 from torch import nn
 
-from dnsmos_trainable.constants import EPS, HOP, INPUT_LEN, LN10, N_BINS, N_FRAMES, WIN
+from dnsmos_trainable.constants import (
+    EPS, HOP, INPUT_LEN, LN10, N_BINS, N_FRAMES, OFFICIAL_CONFIG, WIN,
+)
 
 
 class Framing(nn.Module):
@@ -25,20 +27,25 @@ class Framing(nn.Module):
     which together give overlapping 320-sample windows at hop 160.
     """
 
+    def __init__(self, cfg=OFFICIAL_CONFIG) -> None:
+        super().__init__()
+        self.cfg = cfg
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b = x.shape[0]
-        a = x[:, : INPUT_LEN - HOP].reshape(b, N_FRAMES, HOP)
-        c = x[:, HOP:].reshape(b, N_FRAMES, HOP)
+        cfg = self.cfg
+        a = x[:, : cfg.input_len - cfg.hop].reshape(b, cfg.n_frames, cfg.hop)
+        c = x[:, cfg.hop:].reshape(b, cfg.n_frames, cfg.hop)
         return torch.cat([a, c], dim=2)
 
 
 class TrainedStft(nn.Module):
     """[B, 900, 320] -> re, im each [B, 900, 161] via the trained projections."""
 
-    def __init__(self) -> None:
+    def __init__(self, cfg=OFFICIAL_CONFIG) -> None:
         super().__init__()
-        self.w_re = nn.Parameter(torch.zeros(N_BINS, WIN))
-        self.w_im = nn.Parameter(torch.zeros(N_BINS, WIN))
+        self.w_re = nn.Parameter(torch.zeros(cfg.n_bins, cfg.win))
+        self.w_im = nn.Parameter(torch.zeros(cfg.n_bins, cfg.win))
 
     def forward(self, frames: torch.Tensor):
         re = frames @ self.w_re.T
@@ -57,10 +64,11 @@ class LogPower(nn.Module):
 class Frontend(nn.Module):
     """[B, 144160] -> [B, 1, 900, 161] feature map (NCHW)."""
 
-    def __init__(self) -> None:
+    def __init__(self, cfg=OFFICIAL_CONFIG) -> None:
         super().__init__()
-        self.framing = Framing()
-        self.stft = TrainedStft()
+        self.cfg = cfg
+        self.framing = Framing(cfg)
+        self.stft = TrainedStft(cfg)
         self.logpower = LogPower()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

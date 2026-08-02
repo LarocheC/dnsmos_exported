@@ -143,6 +143,8 @@ class DnsmosLossGraph(nn.Module):
         self.mode = mode
         self.io_layout = io_layout
         self.model = model
+        self.cfg = getattr(model, "cfg", None) or __import__(
+            "dnsmos_trainable.constants", fromlist=["OFFICIAL_CONFIG"]).OFFICIAL_CONFIG
         for p in self.model.parameters():
             p.requires_grad_(False)
         body = model.body
@@ -155,12 +157,13 @@ class DnsmosLossGraph(nn.Module):
         mode = self.mode
 
         # ---- forward recompute, stashing what the VJPs need ----
+        cfg = self.cfg
         if self.io_layout == "rows":
-            frames = torch.cat([wav[:, : N_ROWS - 1, :], wav[:, 1:, :]], dim=2)
+            frames = torch.cat([wav[:, : cfg.n_rows - 1, :], wav[:, 1:, :]], dim=2)
         else:
             b = wav.shape[0]
-            a = wav[:, : INPUT_LEN - HOP].reshape(b, N_FRAMES, HOP)
-            c = wav[:, HOP:].reshape(b, N_FRAMES, HOP)
+            a = wav[:, : cfg.input_len - cfg.hop].reshape(b, cfg.n_frames, cfg.hop)
+            c = wav[:, cfg.hop:].reshape(b, cfg.n_frames, cfg.hop)
             frames = torch.cat([a, c], dim=2)
         re = frames @ fe.stft.w_re.T
         im = frames @ fe.stft.w_im.T
@@ -225,13 +228,13 @@ class DnsmosLossGraph(nn.Module):
         g_frames = g_re @ fe.stft.w_re + g_im @ fe.stft.w_im
 
         if self.io_layout == "rows":
-            g_a = g_frames[:, :, :HOP]
-            g_b = g_frames[:, :, HOP:]
+            g_a = g_frames[:, :, :cfg.hop]
+            g_b = g_frames[:, :, cfg.hop:]
             grad = F.pad(g_a, (0, 0, 0, 1)) + F.pad(g_b, (0, 0, 1, 0))
         else:
             bsz = g_frames.shape[0]
-            g_a = g_frames[:, :, :HOP].reshape(bsz, INPUT_LEN - HOP)
-            g_b = g_frames[:, :, HOP:].reshape(bsz, INPUT_LEN - HOP)
-            grad = F.pad(g_a, (0, HOP)) + F.pad(g_b, (HOP, 0))
+            g_a = g_frames[:, :, :cfg.hop].reshape(bsz, cfg.input_len - cfg.hop)
+            g_b = g_frames[:, :, cfg.hop:].reshape(bsz, cfg.input_len - cfg.hop)
+            grad = F.pad(g_a, (0, cfg.hop)) + F.pad(g_b, (cfg.hop, 0))
 
         return raw, mos, grad

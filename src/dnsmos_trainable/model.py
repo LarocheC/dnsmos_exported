@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from dnsmos_trainable.constants import POLY_BAK, POLY_OVR, POLY_SIG
+from dnsmos_trainable.constants import OFFICIAL_CONFIG, POLY_BAK, POLY_OVR, POLY_SIG
 from dnsmos_trainable.frontend import Frontend
 
 
@@ -15,19 +15,19 @@ class DnsmosBody(nn.Module):
     global max over spatial dims, then 64->128->64->3 dense head.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, cfg=OFFICIAL_CONFIG) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 128, 3, padding=1)
-        self.conv2 = nn.Conv2d(128, 64, 3, padding=1)
-        self.conv3 = nn.Conv2d(64, 64, 3, padding=1)
-        self.conv4 = nn.Conv2d(64, 32, 3, padding=1)
-        self.conv5 = nn.Conv2d(32, 32, 3, padding=1)
-        self.conv6 = nn.Conv2d(32, 32, 3, padding=1)
-        self.conv7 = nn.Conv2d(32, 64, 3, padding=1)
+        self.cfg = cfg
+        c = cfg.channels
+        prev = 1
+        for k in range(7):
+            setattr(self, f"conv{k + 1}", nn.Conv2d(prev, c[k], 3, padding=1))
+            prev = c[k]
         self.pool = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(64, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, 3)
+        f1, f2 = cfg.fc
+        self.fc1 = nn.Linear(c[6], f1)
+        self.fc2 = nn.Linear(f1, f2)
+        self.fc3 = nn.Linear(f2, 3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.relu(self.conv1(x))
@@ -63,10 +63,11 @@ class PolyMapping(nn.Module):
 class DnsmosModel(nn.Module):
     """Full model: waveform [B, 144160] -> (raw [B, 3], mos [B, 3])."""
 
-    def __init__(self) -> None:
+    def __init__(self, cfg=OFFICIAL_CONFIG) -> None:
         super().__init__()
-        self.frontend = Frontend()
-        self.body = DnsmosBody()
+        self.cfg = cfg
+        self.frontend = Frontend(cfg)
+        self.body = DnsmosBody(cfg)
         self.poly = PolyMapping()
 
     def forward(self, wav: torch.Tensor):
