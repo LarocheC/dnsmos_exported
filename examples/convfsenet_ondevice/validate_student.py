@@ -147,6 +147,7 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--cache", type=Path, default=HERE / "artifacts" / "vbd_cache.npz")
     ap.add_argument("--out-dir", type=Path, default=HERE / "artifacts")
+    ap.add_argument("--skip-loop", action="store_true")
     args = ap.parse_args()
 
     torch.set_num_threads(4)
@@ -203,6 +204,82 @@ def main() -> None:
     print(f"student loss graph: {lg.stat().st_size/1e6:.2f} MB | "
           f"STM32N6 lint: {'OK' if not problems else problems}")
     print(f"(flat variant for the demo loop: {flat.name})")
+
+    if args.skip_loop:
+        return
+    run_adaptation(args, cfg, flat, clips[-1])
+
+
+def run_adaptation(args, cfg, student_loss: Path, noisy_full: np.ndarray, steps: int = 30):
+    """Adapt ConvFSENet's mask head with the STUDENT's gradients, then score
+    the result with the OFFICIAL model. This is the claim that matters."""
+    import onnxruntime as ort
+
+    from export_demo_artifacts import export_head_graphs
+    from ondevice_train import NpAdam, OnDeviceEnhancer
+
+    trunk_art = args.out_dir / "convfsenet_trunk_int8.onnx"
+    if not trunk_art.exists():
+        print("\n(skipping loop: run export_demo_artifacts.py first)")
+        return
+
+    noisy = noisy_full[: cfg.input_len].astype(np.float32)
+    conv_T = len(noisy) // 256 + 1
+    print(f"\nadapting ConvFSENet on a {len(noisy)/SR:.2f} s window "
+          f"({conv_T} ConvFSENet frames) using ONLY the student's gradients")
+    # Head graphs are window-specific; write them beside the trunk in a private
+    # directory so a student run never clobbers the demo's shared T=564 pair.
+    loop_dir = args.out_dir / f"loop_T{conv_T}"
+    loop_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("convfsenet_trunk_int8.onnx", "convfsenet_trunk_fp32.onnx"):
+        src = args.out_dir / name
+        if src.exists() and not (loop_dir / name).exists():
+            (loop_dir / name).write_bytes(src.read_bytes())
+    export_head_graphs(256, conv_T, loop_dir)
+
+    eng = OnDeviceEnhancer(loop_dir, student_loss, use_int8_trunk=True)
+    official = ort.InferenceSession(str(args.official), providers=["CPUExecutionProvider"])
+
+    def official_ovrl(x: np.ndarray) -> np.ndarray:
+        y = x
+        while len(y) < OFFICIAL_LEN:
+            y = np.concatenate([y, y])
+        return official.run(None, {"input_1": y[:OFFICIAL_LEN][None].astype(np.float32)})[0][0]
+
+    X, mag = eng.analyse(noisy)
+    h = eng.run_trunk(mag)
+    W = np.zeros((eng.n_features, 192), dtype=np.float64)
+    b = np.full(eng.n_features, 4.0, dtype=np.float64)
+    opt = NpAdam([W.shape, b.shape], lr=3e-3)
+    w_vec = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+
+    base = official_ovrl(noisy)
+    print(f"  official raw scores, noisy input   SIG {base[0]:.3f} BAK {base[1]:.3f} OVRL {base[2]:.3f}")
+    for step in range(steps):
+        mask = eng.mask_of(h, W, b)
+        enhanced, _ = eng.synthesise(X, mask, len(noisy))
+        _, g = eng.dnsmos(enhanced, w_vec)                    # STUDENT gradients
+        sisnr, g_si = dsp.sisnr_and_grad(enhanced, noisy.astype(np.float64))
+        gw = g.astype(np.float64)
+        if sisnr < 6.0:
+            gw -= 0.5 * g_si
+        gY = dsp.istft_adjoint(gw, T=X.shape[1])
+        dmask = dsp.mask_grad(X, gY)[: eng.n_features][None]
+        dW, db = eng.head_grads(dmask, mask, h)
+        uW, ub = opt.step([dW, db])
+        W -= uW; b -= ub
+
+    mask = eng.mask_of(h, W, b)
+    enhanced, _ = eng.synthesise(X, mask, len(noisy))
+    final = official_ovrl(enhanced)
+    sisnr, _ = dsp.sisnr_and_grad(enhanced, noisy.astype(np.float64))
+    print(f"  official raw scores, after {steps:2d} steps SIG {final[0]:.3f} "
+          f"BAK {final[1]:.3f} OVRL {final[2]:.3f}   SI-SNR {sisnr:.1f} dB")
+    print(f"  TRUE OVRL change: {final[2]-base[2]:+.3f}  "
+          f"(BAK {final[1]-base[1]:+.3f}, SIG {final[0]-base[0]:+.3f})")
+    verdict = "the proxy's gradients move the real metric" if final[2] > base[2] + 0.05 \
+        else "NO reliable improvement in the true metric"
+    print(f"  => {verdict}")
 
 
 if __name__ == "__main__":

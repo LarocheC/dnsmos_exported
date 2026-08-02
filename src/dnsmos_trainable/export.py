@@ -13,7 +13,7 @@ import onnx
 import torch
 
 from dnsmos_trainable.backward import DnsmosLossGraph
-from dnsmos_trainable.constants import HOP, INPUT_LEN, N_ROWS
+from dnsmos_trainable.constants import HOP, INPUT_LEN, N_ROWS  # official defaults
 from dnsmos_trainable.model import DnsmosModel
 
 DESKTOP_OPSET = 20
@@ -55,6 +55,11 @@ def export_forward(model: DnsmosModel, out_path: str | Path, device: bool = Fals
     out_path.parent.mkdir(parents=True, exist_ok=True)
     model = model.eval()
 
+    cfg = getattr(model, "cfg", None)
+    f_len = cfg.input_len if cfg else INPUT_LEN
+    f_rows = cfg.n_rows if cfg else N_ROWS
+    f_hop = cfg.hop if cfg else HOP
+
     class _Fwd(torch.nn.Module):
         def __init__(self, m: DnsmosModel, rows: bool) -> None:
             super().__init__()
@@ -75,7 +80,7 @@ def export_forward(model: DnsmosModel, out_path: str | Path, device: bool = Fals
 
     if device:
         wrapper = _Fwd(model, rows=True)
-        example = torch.zeros(1, N_ROWS, HOP)
+        example = torch.zeros(1, f_rows, f_hop)
         torch.onnx.export(
             wrapper,
             (example,),
@@ -87,7 +92,7 @@ def export_forward(model: DnsmosModel, out_path: str | Path, device: bool = Fals
         )
     else:
         wrapper = _Fwd(model, rows=False)
-        example = torch.zeros(2, INPUT_LEN)
+        example = torch.zeros(2, f_len)
         torch.onnx.export(
             wrapper,
             (example,),
@@ -121,8 +126,12 @@ def export_loss_graph(loss: DnsmosLossGraph, out_path: str | Path) -> Path:
     loss = loss.eval()
     w = torch.tensor([0.0, 0.0, -1.0])
 
+    cfg = getattr(loss, "cfg", None)
+    n_rows = cfg.n_rows if cfg else N_ROWS
+    hop = cfg.hop if cfg else HOP
+    flat_len = cfg.input_len if cfg else INPUT_LEN
     if loss.io_layout == "rows":
-        example = torch.zeros(1, N_ROWS, HOP)
+        example = torch.zeros(1, n_rows, hop)
         torch.onnx.export(
             loss,
             (example, w),
@@ -133,7 +142,7 @@ def export_loss_graph(loss: DnsmosLossGraph, out_path: str | Path) -> Path:
             output_names=["raw_scores", "mos_scores", "grad_wav"],
         )
     else:
-        example = torch.zeros(2, INPUT_LEN)
+        example = torch.zeros(2, flat_len)
         torch.onnx.export(
             loss,
             (example, w),
