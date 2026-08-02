@@ -9,4 +9,6 @@ artifacts/
 *.onnx
 *.pt
 .venv/
-examples/convfsenet_ondevice/artifacts/
+examples/convfsenet_ondevice/artifacts*/
+*.npy
+*.npz
