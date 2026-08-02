@@ -169,6 +169,38 @@ def test_vendored_arch_matches_upstream():
     assert win.L == trunk.context_l
 
 
+@pytest.mark.skipif(not ECO8.exists(), reason="eco8-neaixt clone not present")
+def test_checkpoint_loader_roundtrip(tmp_path):
+    """`--checkpoint` (the path a real deployment uses) must reproduce upstream.
+
+    Builds a synthetic eco8-style checkpoint so the loader is exercised without
+    needing the gated published weights.
+    """
+    import json
+
+    sys.path.insert(0, str(ECO8))
+    from common.env import AttrDict
+    from convfsenet.model import build_causal_model
+    from convfsenet.streaming import ConvFSENetWindowedONNX
+
+    from convfsenet_arch import load_from_eco8_checkpoint
+
+    torch.manual_seed(7)
+    cfg = json.loads((ECO8 / "configs" / "convfsenet.json").read_text())
+    base = build_causal_model(AttrDict(cfg))
+    ckpt = tmp_path / "g_best"
+    torch.save({"generator": base.state_dict()}, ckpt)
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+
+    trunk, head = load_from_eco8_checkpoint(ckpt, N_FEATURES, eco8_repo=ECO8)
+    base.eval()
+    T = 16
+    win = ConvFSENetWindowedONNX(base, T=T, drop_nyquist=True).eval()
+    x = torch.rand(1, N_FEATURES, win.L + T) * 3.0
+    with torch.no_grad():
+        assert torch.equal(win.forward_mask_window(x), head(trunk(x)))
+
+
 # --------------------------------------------------------------------------
 # The composite claim: ONNX-free-of-autograd == autograd
 # --------------------------------------------------------------------------
