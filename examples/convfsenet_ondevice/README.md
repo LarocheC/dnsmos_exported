@@ -146,13 +146,17 @@ convolution expands a 900×161 spectrogram to 128 channels, and the backward
 tail nodes held out of quantization (to protect gradient quality) carry that
 tensor in **fp32**, at 128 × 900 × 161 × 4 B. The int8 body is not the problem.
 
-So a compact DNSMOS student is a **requirement** for this target, not an
-optimization. `explore_feasibility.py` maps the frontier and `validate_student.py`
-distills and tests one — see **[FEASIBILITY.md](FEASIBILITY.md)**, which also
-reports the finding that decides the project: a student small enough to fit,
-with OVRL Spearman 0.84 against the official model, still gets *exploited* by
-the optimizer and makes the true metric worse (−0.178 vs +0.151 for the full
-model). Memory is not the hard part; keeping the proxy honest is.
+Shrinking DNSMOS is therefore a **requirement** for this target, not an
+optimization — but *how* you shrink it decides the project.
+`explore_feasibility.py` maps the frontier, `validate_student.py` distills a
+student and `crop_study.py` tests the alternative; see
+**[FEASIBILITY.md](FEASIBILITY.md)**. The headline: a distilled student small
+enough to fit reaches OVRL Spearman 0.84 against the official model and still
+gets *exploited* by the optimizer, making the true metric worse (−0.178 vs
++0.151 for the full model). Cropping the window on the **official weights**
+instead costs nothing to build and steers better than either (+0.475 fp32,
++0.327 int8 at a 2 s window). Memory is not the hard part; keeping the proxy
+honest is.
 
 The enhancer half is 7.57 MB — also above the 2.8 MB `n6-noextmem` pools, but
 that is dominated by the 5.01 MB of 9.01 s working buffers, which scale down

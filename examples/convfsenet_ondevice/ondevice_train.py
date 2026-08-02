@@ -91,9 +91,19 @@ class NpAdam:
 class OnDeviceEnhancer:
     """Wraps the four ONNX sessions with the host-side DSP, as the M55 would."""
 
-    def __init__(self, art_dir: Path, dnsmos_loss: Path, use_int8_trunk=True):
+    def __init__(self, art_dir: Path, dnsmos_loss: Path, use_int8_trunk=True, threads=None):
+        # `threads=1` makes the loop reproducible. It matters only for int8
+        # graphs: fp32 ones are bit-identical at any thread count, while a
+        # QDQ graph's output shifts with reduction order, and the backward's
+        # `Equal` tie masks amplify that ULP into wholesale gradient
+        # rerouting. Both the int8 trunk and an int8 loss graph are affected.
+        opts = None
+        if threads is not None:
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = threads
+
         def sess(p):
-            return ort.InferenceSession(str(p), providers=["CPUExecutionProvider"])
+            return ort.InferenceSession(str(p), opts, providers=["CPUExecutionProvider"])
 
         trunk_name = "convfsenet_trunk_int8.onnx" if use_int8_trunk else "convfsenet_trunk_fp32.onnx"
         self.trunk = sess(art_dir / trunk_name)

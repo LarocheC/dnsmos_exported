@@ -437,3 +437,52 @@ def test_artifacts_pass_device_lint(name, kw):
 
     problems = check_device_constraints(ARTIFACTS / name, max_opset=17, **kw)
     assert not problems, problems
+
+
+# --------------------------------------------------------------------------
+# The window-crop claim (FEASIBILITY.md 5, 5b): the official DNSMOS topology is
+# fully convolutional up to a GLOBAL max pool, so the published weights are
+# valid at any window length. If that ever stops holding, every crop number in
+# FEASIBILITY.md is wrong -- and it would fail silently, since load_state_dict
+# is called with strict=False.
+
+TRANSPLANTED = ROOT / "models" / "dnsmos_transplanted.pt"
+skip_weights = pytest.mark.skipif(
+    not TRANSPLANTED.exists(), reason="run scripts/transplant_weights.py first")
+
+
+@skip_weights
+@pytest.mark.parametrize("window_s", [9.01, 2.0, 1.0])
+def test_cropped_config_takes_official_weights_unchanged(window_s):
+    from crop_study import cropped_config, load_cropped
+
+    cfg = cropped_config(window_s)
+    model = load_cropped(TRANSPLANTED, cfg)          # raises if any param is dropped
+    full = torch.load(TRANSPLANTED, map_location="cpu", weights_only=True)
+    got = dict(model.named_parameters())
+    for name, ref in full.items():
+        if name in got:
+            assert torch.equal(got[name], ref), name
+
+
+@skip_weights
+def test_cropped_model_scores_track_the_full_window():
+    """A crop is a different estimator, not a broken one: it must still rank
+    clean audio above noisy audio, using the untouched published weights."""
+    from crop_study import cropped_config, load_cropped
+
+    rng = np.random.default_rng(0)
+    t = np.arange(SEG) / 16000.0
+    clean = (0.3 * np.sin(2 * np.pi * 220 * t) * (1 + 0.5 * np.sin(2 * np.pi * 3 * t))
+             ).astype(np.float32)
+    noisy = (clean + 0.3 * rng.standard_normal(SEG)).astype(np.float32)
+
+    full = load_cropped(TRANSPLANTED, cropped_config(9.01))
+    crop = load_cropped(TRANSPLANTED, cropped_config(2.0))
+    n = cropped_config(2.0).input_len
+    with torch.no_grad():
+        f_clean, f_noisy = (full(torch.from_numpy(x)[None])[0][0, 2] for x in (clean, noisy))
+        c_clean, c_noisy = (crop(torch.from_numpy(x[:n])[None])[0][0, 2]
+                            for x in (clean, noisy))
+    assert f_clean > f_noisy, (f_clean, f_noisy)
+    assert c_clean > c_noisy, (c_clean, c_noisy)
