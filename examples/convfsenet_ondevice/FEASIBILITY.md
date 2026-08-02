@@ -186,22 +186,68 @@ Adam over 30 steps absorbs the occasional corrupted step, which is why the
 functional result survives. A first-order optimizer with no averaging would
 not be a safe choice here.
 
-Memory, measured on the shipped artifacts rather than analytically:
-all crop variants peak at **15.64 MB** (`[1,128,199,161]`, conv1's output),
-because `op_types_to_quantize` covers only Conv/Gemm/MatMul — the elementwise
-mask/multiply ops of the backward keep that tensor in fp32. That is PSRAM
-territory, not the 2.8 MB `n6-noextmem` pool. The 3.91 MB in the table above
-is what it becomes if the elementwise ops are quantized too; doing that is the
-one remaining piece of work between this result and an on-chip fit.
+Memory, measured on the shipped artifacts rather than analytically: all crop
+variants peak at **15.64 MB** (`[1,128,199,161]`, conv1's output), because
+`op_types_to_quantize` covers only Conv/Gemm/MatMul — the elementwise
+mask/multiply ops of the backward keep that tensor in fp32. Quantizing those
+too would take it to 3.91 MB.
+
+**Neither number fits the 2.8 MB `n6-noextmem` pool**, so the 2 s crop is a
+PSRAM part however it is quantized. Window length is the only free dimension
+on official weights — the 161 bins and 128 first-conv channels are fixed by
+the published tensors — so the on-chip frontier is set purely by frames:
+
+| window | frames | peak int8 | fits 2.8 MB pool? |
+|---:|---:|---:|---|
+| 2.00 s | 199 | 3.91 MB | no |
+| **1.00 s** | **99** | **1.95 MB** | **yes** |
+| 0.50 s | 49 | 0.96 MB | yes |
+
+So there are two deployable targets, not one: the 2 s crop in PSRAM, or the
+1 s crop on-chip (§5c).
+
+## 5c. The 1 s crop — and why the protocol has run out of resolution
+
+`python crop_study.py --window-s 1.0`, same protocol, same clip:
+
+| gradient source | grad cos vs fp32 | ΔTRUE OVRL |
+|---|---:|---:|
+| fp32 1 s crop | 1.000 | +0.281 |
+| int8 1 s, exclude 0 | 0.351 | +0.168 |
+| int8 1 s, exclude 1 | 0.357 | +0.180 |
+| int8 1 s, exclude 2 | 0.357 | **+0.328** |
+
+Read literally: the 1 s crop matches the 2 s crop (+0.328 vs +0.327), fits the
+on-chip pool, and its int8 build beats its own fp32 build by 17 %.
+
+That last claim is not believable, and it is the useful part of this table.
+Quantization cannot improve the gradient it approximates; a +0.328-vs-+0.281
+gap in that direction is noise. **The single-clip, single-seed, 30-step
+protocol has a noise floor comparable to the effects it is being used to
+rank** — which means §5b's choice of ladder rung, and the 2 s-vs-1 s choice
+here, are both currently unresolved.
+
+Everything measured so far survives this: −0.178 (student) vs +0.15…+0.49
+(real weights) is far outside the noise, and that comparison is what the
+project turned on. But the remaining decisions are inside it. The next
+measurement to make is the same adaptation over 20–40 clips with error bars,
+before any more design conclusions are drawn from it.
 
 ## 6. Recommendation
 
 1. **Do not distill a student.** Crop the window on the official weights
-   instead. Recommended operating point: **2 s window, official weights, int8
-   QDQ with no backward convs excluded** — 8.6 GMAC, +0.327 true OVRL (69 % of
-   fp32), 0.98 MB of weights, and the rows-layout export passes the STM32N6
-   lint. Its 15.64 MB activation peak needs PSRAM until the elementwise
-   backward ops are quantized as well (→ 3.91 MB, on-chip).
+   instead — that conclusion is well outside the noise (§4, §5). Two crops are
+   deployable and the choice between them is a memory decision, not yet a
+   quality one:
+   - **2 s, int8** — 8.6 GMAC, +0.327 true OVRL, 3.91 MB peak once the
+     elementwise ops are quantized. **PSRAM part** (N6570-DK).
+   - **1 s, int8** — 4.3 GMAC, +0.328 measured (same, within noise), 1.95 MB
+     peak. **The only official-weight configuration that fits the 2.8 MB
+     `n6-noextmem` pool.**
+
+   Both export cleanly and pass the STM32N6 lint at 0.98 MB of weights. Take
+   the 1 s crop unless a multi-clip evaluation (§5c) shows the 2 s window
+   actually buys something.
 2. **MetricGAN is not needed for this problem, but is still the answer to the
    next one.** On-policy refresh fixes proxy *drift*; it does not create a
    gradient field that was never there. Once you are steering with real
@@ -221,9 +267,23 @@ one remaining piece of work between this result and an on-chip fit.
    limits on-device training.
 6. **Use an averaging optimizer with the int8 graph.** Its gradient is
    intermittently corrupted by tie routing (§5b); Adam over 30 steps absorbs
-   that, plain SGD would not. Quantizing the elementwise backward ops is the
-   next task — it is what takes the peak from 15.64 MB (PSRAM) to 3.91 MB
-   (on-chip).
+   that, plain SGD would not.
+
+### What to do next, in order
+
+1. **Give the adaptation test error bars** (20–40 clips, several seeds).
+   Nothing else on this list can be decided until it exists — §5c shows the
+   current protocol cannot separate the options it is being asked to rank.
+2. **Quantize the elementwise backward ops.** `op_types_to_quantize` covers
+   only Conv/Gemm/MatMul today, which is a 4× penalty on the single largest
+   tensor. Required for either target: 15.64 → 3.91 MB at 2 s, 7.78 → 1.95 MB
+   at 1 s (the on-chip one).
+3. **Replace the MAC model with on-target numbers.** `stedgeai validate
+   --mode target` on `crop1s_fp32_stm32n6.onnx` / its int8 build. Every
+   latency figure in this document is MAC-derived, and the 2.2–15.7 GMAC
+   budget that gates the whole design rests on it.
+4. **Then co-training** (item 2 above). It answers metric-hacking, which only
+   becomes the live risk once the steering signal is settled.
 
 ## Caveats
 
@@ -234,7 +294,10 @@ one remaining piece of work between this result and an on-chip fit.
   trace is independent of the trunk.
 - Timing is MAC-derived from eco8's measured throughput span, not measured on
   target. Only `stedgeai validate --mode target` / `npu_profiler.py` settle it.
-- Adaptation deltas are single-clip, 30-step, and the loop runs the int8
+- Adaptation deltas are single-clip, single-seed, 30-step — a noise floor
+  comparable to the differences between the int8 variants (§5c). Treat the
+  student-vs-real-weights gap as established and every finer ranking as
+  provisional. The loop also runs the int8
   ConvFSENet trunk, which carries the same intermittent nondeterminism as §5b.
   `crop_study.py` pins `--threads 1` and reproduces its table exactly run to
   run; the §4/§5 rows predate that pin and move by ~0.02 OVRL without it.
