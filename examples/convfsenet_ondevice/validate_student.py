@@ -84,7 +84,29 @@ def pearson(a, b):
     return float((a * b).sum() / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
 
 
-def train_student(cfg, clips, targets, steps, batch, lr, seed=0):
+def teacher_gradients(official_ckpt, cfg, clips, w=(0.0, 0.0, -1.0)):
+    """dL/d(wav) from the FULL model, cached — the Sobolev distillation target.
+
+    Score distillation transfers values, not derivatives: a student can reach
+    Spearman 0.84 with a gradient that is orthogonal to the teacher's (measured
+    cosine 0.0002), which is useless for steering an optimizer. Matching the
+    gradient direction explicitly is what fixes that.
+    """
+    from dnsmos_trainable import load_transplanted
+
+    teacher = load_transplanted(official_ckpt)
+    lg = DnsmosLossGraph(teacher, mode="ort", io_layout="flat").eval()
+    wv = torch.tensor(w)
+    grads = []
+    with torch.no_grad():
+        for i in range(0, len(clips), 2):
+            _, _, g = lg(torch.from_numpy(clips[i:i + 2]), wv)
+            grads.append(g.numpy())
+    return np.concatenate(grads)
+
+
+def train_student(cfg, clips, targets, steps, batch, lr, seed=0,
+                  sobolev=0.0, teacher_grads=None, w=(0.0, 0.0, -1.0)):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     model = DnsmosModel(cfg)
@@ -107,13 +129,26 @@ def train_student(cfg, clips, targets, steps, batch, lr, seed=0):
         sel = rng.integers(0, len(clips), batch)
         starts = rng.integers(0, max(span, 1), batch) if span > 0 else np.zeros(batch, int)
         crops = np.stack([clips[s][o:o + cfg.input_len] for s, o in zip(sel, starts)])
-        raw, _ = model(torch.from_numpy(crops))
+        x = torch.from_numpy(crops)
+        if sobolev > 0:
+            x.requires_grad_(True)
+        raw, mos = model(x)
         loss = torch.nn.functional.mse_loss(raw, tgt[sel])
+        cos_term = torch.tensor(0.0)
+        if sobolev > 0:
+            wv = torch.tensor(w)
+            gs = torch.autograd.grad((mos * wv).sum(), x, create_graph=True)[0]
+            gt = torch.from_numpy(teacher_grads[sel])
+            cos = torch.nn.functional.cosine_similarity(
+                gs.reshape(len(sel), -1), gt.reshape(len(sel), -1), dim=1)
+            cos_term = (1.0 - cos).mean()
+            loss = loss + sobolev * cos_term
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step(); sched.step()
         if step % 50 == 0 or step == steps - 1:
-            print(f"  step {step:4d}  mse {loss.item():.4f}  ({time.time()-t0:.0f}s)")
+            extra = f"  1-cos {cos_term.item():.4f}" if sobolev > 0 else ""
+            print(f"  step {step:4d}  loss {loss.item():.4f}{extra}  ({time.time()-t0:.0f}s)")
     model.eval()
     return model
 
@@ -148,6 +183,8 @@ def main() -> None:
     ap.add_argument("--cache", type=Path, default=HERE / "artifacts" / "vbd_cache.npz")
     ap.add_argument("--out-dir", type=Path, default=HERE / "artifacts")
     ap.add_argument("--skip-loop", action="store_true")
+    ap.add_argument("--sobolev", type=float, default=0.0,
+                    help="weight on gradient-direction matching (Sobolev distillation)")
     args = ap.parse_args()
 
     torch.set_num_threads(4)
@@ -180,8 +217,24 @@ def main() -> None:
 
     tr, ho = clips[:-args.holdout], clips[-args.holdout:]
     tr_t, ho_t = targets[:-args.holdout], targets[-args.holdout:]
-    print(f"\ntraining on {len(tr)} clips, {args.steps} steps")
-    model = train_student(cfg, tr, tr_t, args.steps, args.batch, args.lr)
+    tg = None
+    if args.sobolev > 0:
+        if cfg.input_len != OFFICIAL_LEN:
+            raise SystemExit("--sobolev needs --window-s 9.01 (teacher gradients are 9.01 s)")
+        gcache = args.out_dir / "teacher_grads.npy"
+        if gcache.exists():
+            tg = np.load(gcache)
+        else:
+            print("computing teacher gradients (one-off)...")
+            t0 = time.time()
+            tg = teacher_gradients(HERE.parents[1] / "models" / "dnsmos_transplanted.pt", cfg, clips)
+            np.save(gcache, tg); print(f"  {time.time()-t0:.0f}s")
+        tg = tg[:len(tr)]
+
+    print(f"\ntraining on {len(tr)} clips, {args.steps} steps"
+          f"{f' (Sobolev lambda={args.sobolev})' if args.sobolev else ''}")
+    model = train_student(cfg, tr, tr_t, args.steps, args.batch, args.lr,
+                          sobolev=args.sobolev, teacher_grads=tg)
 
     _, corr = student_eval(model, cfg, ho, ho_t)
     print(f"\nheld-out agreement with the official teacher ({len(ho)} clips):")
