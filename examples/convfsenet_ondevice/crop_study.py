@@ -170,18 +170,19 @@ def grad_cosines(fp32_path: Path, int8_path: Path, clips: np.ndarray,
             "ratio_mean": float(np.mean(ratio))}
 
 
-def adapt_and_score(loss_path: Path, official_onnx: Path, art_dir: Path,
-                    noisy_full: np.ndarray, input_len: int, steps: int = 30,
-                    threads: int | None = 1):
-    """Adapt ConvFSENet's mask head with `loss_path` gradients; score with the
-    OFFICIAL model. The only number that means anything."""
-    import onnxruntime as ort
+def build_engine(loss_path: Path, art_dir: Path, input_len: int,
+                 threads: int | None = 1):
+    """One `OnDeviceEnhancer` for a given (loss graph, window).
 
+    Head graphs are window-specific, so they are written to a private
+    `loop_T<n>` directory rather than clobbering the demo's shared pair.
+    Building this is the expensive part of an adaptation -- hoist it out of
+    any loop over clips.
+    """
     from export_demo_artifacts import export_head_graphs
-    from ondevice_train import NpAdam, OnDeviceEnhancer
+    from ondevice_train import OnDeviceEnhancer
 
-    noisy = noisy_full[:input_len].astype(np.float32)
-    conv_T = len(noisy) // 256 + 1
+    conv_T = input_len // 256 + 1
     loop_dir = art_dir / f"loop_T{conv_T}"
     loop_dir.mkdir(parents=True, exist_ok=True)
     for name in ("convfsenet_trunk_int8.onnx", "convfsenet_trunk_fp32.onnx"):
@@ -189,20 +190,43 @@ def adapt_and_score(loss_path: Path, official_onnx: Path, art_dir: Path,
         if src.exists() and not (loop_dir / name).exists():
             (loop_dir / name).write_bytes(src.read_bytes())
     export_head_graphs(256, conv_T, loop_dir)
+    return OnDeviceEnhancer(loop_dir, loss_path, use_int8_trunk=True, threads=threads)
 
-    eng = OnDeviceEnhancer(loop_dir, loss_path, use_int8_trunk=True, threads=threads)
-    official = ort.InferenceSession(str(official_onnx), providers=["CPUExecutionProvider"])
 
-    def official_scores(x: np.ndarray) -> np.ndarray:
+def official_session(official_onnx: Path):
+    import onnxruntime as ort
+
+    sess = ort.InferenceSession(str(official_onnx), providers=["CPUExecutionProvider"])
+
+    def score(x: np.ndarray) -> np.ndarray:
+        """Official P.835 scores. Short crops are tiled up to the 9.01 s the
+        published graph requires -- the JUDGE always sees a full segment,
+        whatever window the gradient source used."""
         y = x
         while len(y) < OFFICIAL_LEN:
             y = np.concatenate([y, y])
-        return official.run(None, {"input_1": y[:OFFICIAL_LEN][None].astype(np.float32)})[0][0]
+        return sess.run(None, {"input_1": y[:OFFICIAL_LEN][None].astype(np.float32)})[0][0]
 
+    return score
+
+
+def adapt_one(eng, official_scores, noisy_full: np.ndarray, input_len: int,
+              steps: int = 30, seed: int | None = None):
+    """Adapt the mask head on one clip; return (base, final, si-snr) scores."""
+    from ondevice_train import NpAdam
+
+    noisy = noisy_full[:input_len].astype(np.float32)
     X, mag = eng.analyse(noisy)
     h = eng.run_trunk(mag)
-    Wm = np.zeros((eng.n_features, 192), dtype=np.float64)
-    b = np.full(eng.n_features, 4.0, dtype=np.float64)
+    if seed is None:
+        Wm = np.zeros((eng.n_features, 192), dtype=np.float64)
+        b = np.full(eng.n_features, 4.0, dtype=np.float64)
+    else:
+        # Perturbing the head init separates "this gradient source works" from
+        # "this gradient source works from THAT starting point".
+        rng = np.random.default_rng(seed)
+        Wm = rng.normal(0.0, 0.01, (eng.n_features, 192))
+        b = 4.0 + rng.normal(0.0, 0.1, eng.n_features)
     opt = NpAdam([Wm.shape, b.shape], lr=3e-3)
 
     base = official_scores(noisy)
@@ -325,10 +349,11 @@ def main() -> None:
         (f"int8 crop (exclude={d})", results[d][0]) for d in args.ladder
     ]
     gains = {}
+    official_scores = official_session(args.official)
     for i, (label, path) in enumerate(runs):
-        base, final, sisnr = adapt_and_score(path, args.official, args.demo_artifacts,
-                                             clips[-1], cfg.input_len, args.steps,
-                                             threads=args.threads)
+        eng = build_engine(path, args.demo_artifacts, cfg.input_len, args.threads)
+        base, final, sisnr = adapt_one(eng, official_scores, clips[-1],
+                                       cfg.input_len, args.steps)
         if i == 0:
             print(f"  {'noisy':<28} SIG {base[0]:.3f} BAK {base[1]:.3f} OVRL {base[2]:.3f}")
         gains[label] = final[2] - base[2]
