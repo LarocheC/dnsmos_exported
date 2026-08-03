@@ -587,3 +587,50 @@ its own trained STFT, quantized and cropped — remains the only source in this
 repo that has demonstrably improved the true metric. That is an argument for
 finishing the on-device DNSMOS path (i.e. the ST defect) rather than replacing
 it.
+
+---
+
+## Deploying the PESQ predictor: the ST defect is avoided at compile time
+
+Rationale (user's): full ownership of the metric matters for deployment — a
+181,650-parameter model trained in-house beats a transplanted third-party one
+— and the predictor's *architecture* is a direct test of the ST diagnosis. The
+DNSMOS loss graph fails inside ST's int8<->float **software**-epoch boundary,
+which exists because its hand-written backward carries a large fp32 elementwise
+mask region between int8 conv blocks. This model has no such region.
+
+`export_pesq_predictor.py`. Two export details mattered:
+
+* **`spectral_norm` uses the old hook API**, so `.eval()` does not disable it
+  and `remove_parametrizations` does not see it. Exported live, the power
+  iteration itself is traced into the graph — 12 `MatMul` + 6 `Div` of pure
+  normalization arithmetic. `remove_spectral_norm` folds it once and the graph
+  drops from those 18 stray ops (940 kB int8) to none (**200 kB**).
+* `Flatten` -> `Reshape`; after a global max-pool to `[B,C,1,1]` they are identical.
+
+Result: torch-vs-ONNX parity **1.8e-07**, int8 costs **0.020 PESQ** mean
+(max 0.041), and it **compiles for the on-chip `n6-noextmem` profile**:
+
+| | epochs | HW / hybrid / SW | weights | MACC |
+|---|---:|---|---:|---:|
+| DNSMOS loss graph (0.25 s) | 201 | 35 / 41 / **125** | 2.24 MB | 1,183 M |
+| **PESQ predictor** | **35** | **12 / 0 / 23** | 727 kB | 26 M |
+
+Zero hybrid epochs, 45x fewer MACs, and it fits the on-chip pools that the
+DNSMOS loss graph could never fit. The repo's lint flags
+`InstanceNormalization` as outside its op vocabulary — that list is an
+approximation, and the compiler accepted it, consistent with everything else
+this session found about lint-vs-compiler.
+
+**Still to measure**: on-target numerics (does it return input-dependent,
+correct values where the DNSMOS loss graph returns a constant?). The board
+wedged at "Cannot connect to access port 1" before this run — the known
+replug-only state.
+
+Note on the negative PESQ steering result above: the user's point that
+ConvFSENet is a PESQ metric-GAN trained on this very dataset is well taken and
+partly explains it — baseline PESQ was already 3.3-3.9, so there was little to
+climb and the optimizer could only descend. That does not explain the +5.33
+optimism (the predictor reporting 7.8 where PESQ maxes at 4.5), which is
+off-distribution behaviour independent of headroom. A fairer steering test
+would start from a *weaker* enhancer, where real headroom exists.
