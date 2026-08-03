@@ -61,9 +61,10 @@ static const LL_Buffer_InfoTypeDef *buf_by_size(const LL_Buffer_InfoTypeDef *buf
 static void pf(const char *tag, float x)
 {
   union { float f; uint32_t u; } c = { .f = x };
-  long milli = (long)(x * 1000.0f);
-  printf("%s=%ld.%03lde-3 (bits=0x%08lx)", tag, milli / 1000, labs(milli) % 1000,
-         (unsigned long)c.u);
+  long milli = (long)(x * 1000.0f);          /* value scaled by 1e3, printed back */
+  const char *sign = (x < 0 && milli / 1000 == 0) ? "-" : "";
+  printf("%s=%s%ld.%03ld (bits=0x%08lx)", tag, sign, milli / 1000,
+         labs(milli) % 1000, (unsigned long)c.u);
 }
 
 static void print_f32_stats(const char *tag, const float *v, uint32_t n)

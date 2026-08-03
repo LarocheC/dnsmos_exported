@@ -31,11 +31,13 @@ artifact, not the host one.
 
 ## Blocker #1 — the fused loss graph hangs in a SW `DequantizeLinear`
 
-Reproducible on both `-O3` and `-O1` builds: per-epoch streaming shows epochs
-0–63 completing in **2.5–4.9 s total**, then the firmware never returns from
-epoch 64/204 (`DequantizeLinear`, pure-SW, in the backward's first
-`Equal/Cast/Sub/Mul` mask block — the peak-setting fp32 region, hyperRAM
-resident). Waited >10 min twice; identical stop point across five loads. The
+Reproducible on both `-O3` and `-O1` builds: per-epoch streaming shows the
+first 64 epochs (report IDs `epoch_1`..`epoch_64`, last one `Sub(float)`)
+completing in **2.5–4.9 s total**, then the firmware never returns from
+**`epoch_65` of 204 — a pure-SW `DequantizeLinear`** in the backward's first
+`Equal/Cast/Sub/Mul` mask block (the peak-setting fp32 region, hyperRAM
+resident). (Runtime callbacks are 0-based, report epoch IDs 1-based; quoted
+here in report numbering.) Waited >10 min twice; identical stop point across five loads. The
 graph itself is fine (identical outputs in ORT; first 63 epochs run on target),
 so the blocker is the ll_aton SW kernel and/or its hyperRAM buffer placement.
 Escalation path: ST bug report with `n6_gen/dnsmos_loss_crop1s_int8_d2` +
