@@ -444,16 +444,58 @@ keeps falling (0.054 -> 0.027) while held-out OVRL correlation drops 0.926 ->
 0.863 and SIG collapses 0.824 -> 0.483, so the 30-epoch checkpoint is the one
 to use with this 112-clip training set.
 
-### Status: correlation reached, steering unproven
+### Verdict: the correlation is real, the steering is not — and the adapter is exploited
 
-`adapter_adapt_eval.py` runs the test that matters — adapt the real mask head
-with each gradient source, paired on the same held-out clips, scored with the
-official 9.01 s DNSMOS. An early 2-clip smoke run flagged the risk plainly: on
-one clip the spectral path *decreased* true OVRL (-0.133) where the waveform
-path gained +1.245. The harness reports a paired 95% CI and refuses to
-conclude when the sample cannot resolve the difference.
+`adapter_adapt_eval.py`, 8 held-out clips, 40 steps, paired, scored with the
+official 9.01 s DNSMOS:
 
-Until that evaluation passes on a real sample size, the architecture win
-(46x less DSP, no ISTFT-adjoint, 18% fewer graph nodes) is **not** established
-as usable — a 0.93-correlation scorer that steers badly is precisely the
-failure this repo has now documented three times.
+| | mean dOVRL | better on |
+|---|---:|---|
+| waveform path (today) | **+1.536** | 8/8 clips |
+| spectral path (adapter) | +0.589 | 0/8 clips |
+
+Paired difference **-0.948 [95% CI ±0.522]** — the interval excludes zero, so
+this is *resolved*, not a sample-size problem. The adapter delivers 38 % of the
+gain, and on 2 of 8 clips essentially none (+0.036, -0.074).
+
+**Why**: the optimizer exploits it. Re-scoring the adapter's own optimized
+output against the truth:
+
+| clip | adapter believes | official truth | optimism |
+|---|---:|---:|---:|
+| 0 | 4.213 | 2.550 | **+1.663** |
+| 1 | 4.272 | 1.802 | **+2.470** |
+| 2 | 4.492 | 1.160 | **+3.331** |
+| 3 | 4.167 | 2.689 | **+1.478** |
+
+**mean optimism +2.24 MOS.** The same adapter agrees with truth at Spearman
+0.89 on *natural* clips — and is off by more than two MOS on the adversarial
+spectrograms the optimizer itself steers into. Rank correlation on the natural
+distribution says nothing about behaviour off it, which is exactly the
+distribution a gradient source is dragged into.
+
+This reproduces `FEASIBILITY.md`'s student result — Spearman 0.84, true metric
+worse on 77 % of clips — with a completely different and much more constrained
+surrogate: 5,665 trainable parameters in front of a frozen, bit-exact official
+body. That the failure survives *this* much constraint is the finding. The
+metric's own trained STFT front end is apparently not a detachable
+implementation detail; it is part of what makes DNSMOS hard to fool.
+
+### Where that leaves the idea
+
+The architecture argument is untouched and still attractive — 46x less DSP, no
+`istft_adjoint`, 18 % fewer nodes, 2 of 6 irreducible-float ops gone. What is
+refuted is the *cheap* route to it (resample + small learned correction). Paths
+that remain open, in increasing cost:
+
+1. **Adversarial / iterated training** — retrain the adapter on the
+   spectrograms the optimizer actually produces, not just natural ones, and
+   iterate. Directly targets the measured failure.
+2. **Port the trained STFT instead of approximating it.** DNSMOS's kernels are
+   fixed matrices; a 512/256 -> 320/160 re-analysis could be done exactly in
+   the spectral domain rather than learned, keeping the metric bit-exact and
+   still avoiding the ISTFT round trip.
+3. **Keep the waveform path** and take the memory win elsewhere.
+
+Option 2 is the one that preserves what makes the metric robust, and is the
+natural next experiment.
