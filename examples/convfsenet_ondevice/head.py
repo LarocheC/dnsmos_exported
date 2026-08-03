@@ -57,6 +57,27 @@ class HeadBackward(nn.Module):
         return dW, db
 
 
+class HeadBackwardHT(nn.Module):
+    """(dmask, mask, hT) -> (dW, db) — the ST-compilable form of HeadBackward.
+
+    Identical math, but takes h pre-transposed (hT [B, T, 192]) instead of
+    transposing in-graph: ST Edge AI 4.0.1's front end crashes on Transpose of
+    a runtime tensor ("Mismatch in channel position"), while a dynamic x
+    dynamic MatMul without the Transpose compiles (bisected op-by-op; the
+    elementwise chain, the rank-2 reducing sum and the ReduceMean db path all
+    compile individually). Pre-transposing costs nothing on device: the host
+    banks h column-by-column anyway, so writing rows of [T, 192] instead of
+    columns of [192, T] is the same memcpys with different strides.
+    """
+
+    def forward(self, dmask: torch.Tensor, mask: torch.Tensor, hT: torch.Tensor):
+        dz = dmask * mask * (1.0 - mask)                       # [B, F, T]
+        dW = torch.matmul(dz, hT).sum(0)                       # [F, 192]
+        n_t = float(dz.shape[-1])
+        db = (dz.mean(dim=-1) * n_t).sum(0)                    # [F]
+        return dW, db
+
+
 def head_reference_loss(h: torch.Tensor, W: torch.Tensor, b: torch.Tensor,
                         dmask: torch.Tensor) -> torch.Tensor:
     """Scalar whose dW/db equal HeadBackward's outputs — used by the autograd test.

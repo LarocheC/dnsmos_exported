@@ -12,3 +12,8 @@ artifacts/
 examples/convfsenet_ondevice/artifacts*/
 *.npy
 *.npz
+
+# STM32N6 build outputs and baked-in test vectors (regenerate with the scripts)
+examples/convfsenet_ondevice/n6_gen/
+examples/convfsenet_ondevice/firmware_loss/loss_input.h
+ai_runner.log
