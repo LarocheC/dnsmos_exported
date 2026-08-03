@@ -43,7 +43,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "src"))
 
-TRANSPARENT = {"Unsqueeze", "Reshape", "Concat", "Slice", "Squeeze", "Transpose"}
+# Ops a quantization grid passes through unchanged. Includes the pooling/pad
+# ops because `repair_mask_consistency` clones a MaxPool/Reshape/Concat/Pad
+# chain after quantization; those clones sit inside the quantized region and
+# their zero-pads must be pre-quantized too, or ST rejects the dtype mix
+# ("not implemented shape len for Conversion").
+TRANSPARENT = {"Unsqueeze", "Reshape", "Concat", "Slice", "Squeeze", "Transpose",
+               "MaxPool", "AveragePool", "ReduceMax", "Pad", "Relu", "Clip"}
 
 
 def normalize_slices(m: onnx.ModelProto) -> int:
@@ -156,12 +162,15 @@ def quantize_pad_zeros(m: onnx.ModelProto) -> int:
 
     def find_dq(name, depth=0):
         n = byout.get(name)
-        if n is None or depth > 12:
+        if n is None or depth > 24:
             return None
         if n.op_type == "DequantizeLinear":
             return n
         if n.op_type in TRANSPARENT:
-            return find_dq(n.input[0], depth + 1)
+            for inp in n.input:                      # Concat repeats its source
+                r = find_dq(inp, depth + 1)
+                if r is not None:
+                    return r
         return None
 
     new_nodes, converted = [], 0

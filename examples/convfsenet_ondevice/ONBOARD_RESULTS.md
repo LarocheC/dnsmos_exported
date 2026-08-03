@@ -293,3 +293,74 @@ project does not link newlib float printf (`%f` silently wedges the UART
 mid-line — print IEEE-754 bits instead), and a bare runner must call
 `LL_ATON_RT_RuntimeInit()` or the first `RunEpochBlock` parks in
 `LL_ATON_OSAL_WFE()` forever.
+
+---
+
+## Could the loss graph run fully in int8? (`int8_coverage_study.py`)
+
+Motivation: the ST defect lives at the int8↔float boundary of *software*
+epochs, and a graph without such a boundary cannot trip it — plus every tensor
+moved to int8 is 4× less memory on the part where the fp32 tail sets the peak.
+
+**Short answer: not strictly, but the irreducible part is tiny — and the
+blocker for the rest is structural, not a quantizer setting.**
+
+### Where the float traffic actually is (0.25 s graph, shipped recipe)
+
+Counting only tensors that truly materialize as fp32 on device (a node whose
+every consumer is a `QuantizeLinear` gets folded into an int8 kernel):
+**22.2 MB across 184 nodes.**
+
+| op | fp32 MB | share | can it be int8? |
+|---|---:|---:|---|
+| `Concat` | 5.64 | 25 % | yes — pure data movement |
+| `Equal` | 5.05 | 23 % | yes — int8 equality is **exact** when both sides share a scale |
+| `Reshape` + `Unsqueeze` | 5.54 | 25 % | yes — pure data movement |
+| `Mul` | 1.57 | 7 % | partly — quantizing *every* `Mul` zeroes the gradient |
+| `Cast` | 1.28 | 6 % | yes — bool→int8 instead of bool→float |
+| `Sub` / `Clip` / `Relu` | 1.89 | 9 % | yes — standard QDQ ops |
+| **`Reciprocal` + `Log`** | **0.65** | **3 %** | **no — division / transcendental; needs a LUT or fixed-point rewrite** |
+
+So ~75 % of the float traffic does **no arithmetic at all** — it is data
+movement and comparisons — and only 3 % is genuinely irreducible.
+
+### Why the quantizer cannot reach it
+
+ORT inserts QDQ only where a quantized tensor already flows. The backward's
+mask chain is rooted at `Equal`, which consumes `DequantizeLinear` *outputs*
+(float) and emits **bool** — a type with no quantization grid. Everything
+downstream (`Cast` → `Sub` → `Mul`, plus the `Concat`/`Reshape` interleave
+upsampling) is therefore float-rooted and unreachable, no matter which op types
+are registered.
+
+Closing that gap needs a **graph rewrite**, not a setting: have `Equal` compare
+the raw int8 tensors directly (exact integer comparison — arguably better than
+the fp32 one it replaces) and emit an int8 0/1 mask, so the chain stays int8
+end to end. The repo's `repair_mask_consistency` already does half of this
+work, rebuilding the max-side chain rooted at the exact tensor instance.
+
+### What is achievable today, measured
+
+Registering the data-movement and standard pooling ops
+(`Reshape`/`Unsqueeze`/`Squeeze`/`Slice`/`Transpose` + `MaxPool`/`AveragePool`/
+`Relu`/`Clip`) does compile and lint clean, on-chip pools included:
+
+| recipe | SW epochs | grad cos (mean/min) | \|g8\|/\|g32\| | adaptation dOVRL |
+|---|---:|---:|---:|---:|
+| shipped | 125 | 0.658 / 0.513 | 0.71 | **+0.518** |
+| +movement+pool | **119** | **0.781 / 0.580** | **0.99** | +0.377 |
+
+The agreement metrics improve markedly — the gradient norm ratio going from
+0.71 to ~1.0 means the int8 gradient no longer systematically shrinks — **but
+the functional adaptation on the one test clip is worse**. That is this repo's
+recurring lesson (`crop_study.py`: "cosine does not rank steering"), and a
+single clip is exactly the kind of evidence an earlier commit had to retract as
+noise. **Ranking these two recipes needs the paired multi-clip protocol in
+`adaptation_eval.py`; it is currently unresolved.**
+
+### Would it dodge the ST defect?
+
+Only the full rewrite would meaningfully shrink the failing region, and even
+then `Log`/`Reciprocal` keep a small int8↔float boundary. So this is a
+worthwhile memory and (possibly) quality optimization, **not a reliable
+workaround** for the vendor bug.
