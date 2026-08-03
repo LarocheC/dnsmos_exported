@@ -622,10 +622,38 @@ DNSMOS loss graph could never fit. The repo's lint flags
 approximation, and the compiler accepted it, consistent with everything else
 this session found about lint-vs-compiler.
 
-**Still to measure**: on-target numerics (does it return input-dependent,
-correct values where the DNSMOS loss graph returns a constant?). The board
-wedged at "Cannot connect to access port 1" before this run — the known
-replug-only state.
+### On-target: it runs correctly — the defect is confirmed localized
+
+Loaded to `n6-noextmem` and fed six candidates spanning the PESQ range:
+
+| candidate | true PESQ | host int8 | **device** | \|d\| |
+|---|---:|---:|---:|---:|
+| 3 | 3.19 | 3.27 | **3.27** | 0.000 |
+| 17 | 4.14 | 3.49 | **3.52** | 0.028 |
+| 42 | 2.14 | 3.19 | **3.19** | 0.000 |
+| 88 | 1.10 | 1.10 | **1.11** | 0.005 |
+| 123 | 3.79 | 3.66 | **3.66** | 0.000 |
+| 260 | 3.49 | 2.82 | **2.82** | 0.000 |
+
+* **device vs host int8: mean 0.0056 PESQ, max 0.028** — the device reproduces
+  the host artifact.
+* **Output spread 1.11–3.66.** The DNSMOS loss graph's failure signature is a
+  bit-identical constant across different inputs; here the output tracks the
+  input, correlating +0.84 with true PESQ over these six.
+* **37.6 ms per inference**, entirely on-chip.
+
+Against the DNSMOS loss graph on the same board and toolchain: **4,800 ms and
+input-independent garbage** versus **37.6 ms and correct**. That is a 128x
+speedup and the difference between unusable and deployable — and it is direct
+evidence for the bug report's diagnosis, since the only structural difference
+that matters is the absence of the fp32 elementwise mask region that creates
+the int8<->float software-epoch boundary.
+
+**A metric the project owns, running correctly on the target.** What remains
+for a full on-device adaptation loop is the predictor's *backward* pass, which
+would be built the same way as the DNSMOS one (hand-written ONNX ops) but over
+a far simpler graph — no `Equal`/`Cast` mask chains, so no fp32 elementwise
+region, so no exposure to the ST defect.
 
 Note on the negative PESQ steering result above: the user's point that
 ConvFSENet is a PESQ metric-GAN trained on this very dataset is well taken and
