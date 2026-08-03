@@ -364,3 +364,73 @@ Only the full rewrite would meaningfully shrink the failing region, and even
 then `Log`/`Reciprocal` keep a small int8↔float boundary. So this is a
 worthwhile memory and (possibly) quality optimization, **not a reliable
 workaround** for the vendor bug.
+
+---
+
+## Feeding DNSMOS from the enhancer's spectrogram (`spectral_adapter.py`)
+
+Idea (user's): the enhancer already computes an STFT, and DNSMOS computes
+another one internally. Drop the second, and the ISTFT between them.
+
+It is better founded than it first appears, because the enhancer applies a
+**real gain**: the enhanced magnitude is exactly `|Y| = |X| · mask` in the
+enhancer's own domain, so no synthesis is needed to obtain it, and the weight
+gradient collapses to
+
+    dL/dmask = dL/d|Y| · |X|          (one elementwise multiply)
+
+replacing the ISTFT-adjoint and the complex mask VJP. Two facts checked before
+building anything:
+
+* **Consistency**: `|STFT(ISTFT(X·mask))|` vs `|X·mask|` — cosine **0.9999**,
+  1.3 % relative error, for both smooth and hard-gate masks. A magnitude-domain
+  metric sees essentially what DNSMOS sees.
+* **Phase**: normally the fatal objection to a magnitude-only metric. Not here —
+  a real gain *cannot* alter phase, so nothing is lost **for this loop**. It
+  would be lost for a phase-modifying enhancer.
+
+Measured savings: **46× less host DSP per adaptation window** (1.763 ms →
+0.038 ms), `istft_adjoint` — the hardest-verified function in `dsp.py` — leaves
+the backward entirely, **59 of 329 graph nodes (18 %)** disappear, and 2 of the
+6 irreducible-float ops go with them (the `Log` and one `Reciprocal` live in
+the STFT frontend/adjoint).
+
+### Two surprises from the experiment
+
+**1. A plain bilinear resample already carries most of the signal.** With no
+training at all, feeding the frozen official body a bilinear-resampled
+enhancer spectrogram gives, on 40 held-out clips:
+
+| | pearson | spearman | mean abs err |
+|---|---:|---:|---:|
+| SIG | 0.719 | 0.498 | 0.238 |
+| BAK | **0.827** | **0.860** | 0.383 |
+| OVRL | **0.802** | 0.753 | 0.272 |
+
+(An earlier estimate of 0.27–0.57 in this session was **wrong** — it used
+nearest-neighbour time indexing and a stray ×10 on the log scale. Corrected
+here.)
+
+**2. Regressing the feature map is actively harmful.** Training the adapter to
+match the official `Frontend(wav)` output — ~145k densely supervised values per
+clip instead of 3 — cuts eval feature MSE **6.4× (6.04 → 0.94)** while dropping
+BAK rank correlation from **0.860 to 0.154** and OVRL from 0.753 to 0.510. The
+body reads a **global max** over the spectrogram; MSE smooths exactly the peaks
+that max selects, so being closer on average is worse where it counts.
+
+That is the third independent instance in this repo of the same lesson — an
+agreement metric that improves while the thing you care about degrades (after
+`crop_study.py`'s "cosine does not rank steering" and the int8-coverage
+recipe). The default objective is therefore `--loss score`: the frozen body is
+differentiable, so the 5.7k-parameter adapter is regressed on the three mapped
+scores it must preserve, with the metric itself frozen and bit-exact so the
+learned part cannot reshape what "quality" means.
+
+### Status
+
+Zero-training bilinear resample is a usable starting point on rank
+correlation; score-space training of the correction is the current experiment.
+Neither is trustworthy as a gradient source until it passes the paired
+multi-clip protocol in `adaptation_eval.py` — rank correlation is necessary,
+not sufficient, and this architecture's whole point is to be a *gradient*
+source.
