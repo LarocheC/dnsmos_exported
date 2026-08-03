@@ -149,3 +149,20 @@ def sisnr_and_grad(est: np.ndarray, ref: np.ndarray, eps: float = 1e-10):
     value = 10.0 * np.log10(t2 / e2)
     g = (20.0 / np.log(10.0)) * (target / t2 - noise / e2)
     return value, g - g.mean()
+
+
+def rms_normalize(x: np.ndarray, eps: float = 1e-8):
+    """eco8-neaixt's input scaling: unit-RMS in, inverse applied to the output.
+
+    ConvFSENet is trained on RMS-normalized audio (`inference_onnx.py`:
+    `norm_factor = sqrt(len(x) / sum(x**2))`), and its first op is a power-law
+    compression `(|X| + 1e-9) ** 0.3` — so the level of the input decides what
+    range every downstream conv sees. Feeding raw audio does not degrade the
+    mask gracefully, it destroys it: on VoiceBank-DEMAND test segments the
+    enhancer scores PESQ 1.10 unnormalized versus 3.43 normalized (noisy 2.48).
+
+    Returns (scaled_x, norm_factor); divide the synthesized output by the same
+    factor to restore the original level.
+    """
+    nf = float(np.sqrt(len(x) / (np.sum(np.asarray(x, dtype=np.float64) ** 2) + eps)))
+    return np.asarray(x) * nf, nf

@@ -171,13 +171,17 @@ def main() -> None:
     w_vec = np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
     def official_scores(wav: np.ndarray) -> np.ndarray:
-        seg = wav.astype(np.float32)
+        seg = (np.asarray(wav) / norm_factor).astype(np.float32)   # original level
         while len(seg) < OFFICIAL_LEN:
             seg = np.concatenate([seg, seg])
         return official.run(None, {"input_1": seg[:OFFICIAL_LEN][None]})[0][0]
 
     clips = np.load(args.cache)["clips"]
-    noisy = clips[args.clip].astype(np.float64)
+    noisy_raw = clips[args.clip].astype(np.float64)
+    # ConvFSENet expects RMS-normalized input (see dsp.rms_normalize): the
+    # power-law prologue makes the mask level-dependent, and raw audio yields
+    # a destroyed mask rather than a degraded one.
+    noisy, norm_factor = dsp.rms_normalize(noisy_raw)
     X = dsp.stft(noisy)                                    # [257, T]
     T = X.shape[1]
     n_windows = T // W_FRAMES

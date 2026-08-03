@@ -166,12 +166,11 @@ official 9.01 s DNSMOS raw OVRL, single streaming pass = 8 updates):
 
 Two findings:
 
-1. **The trained ConvFSENet scores far below noisy on official DNSMOS** for
-   these clips (its masks match upstream's deployed `g_best.onnx` — mean
-   mask stats 0.142 vs 0.144 — so this is the real enhancer, not a port
-   bug). DNSMOS-driven adaptation recovers part of the gap. (PESQ, the
-   metric ConvFSENet was tuned for, tells the opposite story — 2.911 int8 on
-   VBD; the two metrics genuinely disagree about this model.)
+1. ~~**The trained ConvFSENet scores far below noisy on official DNSMOS**~~ —
+   **RETRACTED, see the CORRECTION section at the end of this file.** This was
+   a missing RMS normalization in the harness, not a property of the model.
+   With the fix the enhancer scores PESQ 3.43 vs noisy 2.48. The gains in the
+   table above are therefore measured from a crippled baseline.
 2. **Multi-pass replay is live metric hacking**: over 4 passes on the same
    clip the on-device crop proxy rises monotonically (1.57 -> 1.74) while
    the official score falls (2.565 -> 2.339). The proxy cannot early-stop
@@ -499,3 +498,92 @@ that remain open, in increasing cost:
 
 Option 2 is the one that preserves what makes the metric robust, and is the
 natural next experiment.
+
+---
+
+## CORRECTION: a normalization bug invalidated several adaptation numbers above
+
+ConvFSENet is trained on **RMS-normalized** input (`eco8-neaixt/convfsenet/
+inference_onnx.py`: `norm_factor = sqrt(len(x) / sum(x**2))`, un-scaled after
+the iSTFT). Its first operation is a power-law compression `(|X|+1e-9)**0.3`,
+so the input *level* sets the range every downstream conv sees. Feeding raw
+audio does not degrade the mask gracefully — it destroys it:
+
+| VBD test segments (6 s) | PESQ |
+|---|---:|
+| noisy | 2.482 |
+| enhanced, **no** RMS norm (the bug) | 1.097 |
+| enhanced, **with** RMS norm | **3.430** |
+
+Confirmed against upstream's own deployed `g_best.onnx`, which scores the same
+1.058 when fed unnormalized — so the vendored split was always faithful; the
+harness was wrong. Fixed via `dsp.rms_normalize`, applied in
+`streaming_adapt.py` and `pesq_adapt_eval.py`.
+
+**What this invalidates, above:**
+
+* The claim that "the trained ConvFSENet scores far below noisy on official
+  DNSMOS" — **wrong**. That was this bug, not a metric disagreement. The mask
+  statistics check that seemed to confirm it (mean 0.142 vs upstream 0.144) was
+  too weak: per-element the masks differed by up to 0.42.
+* The streaming single-pass adaptation gains (+0.245 / +0.050 / +0.600 /
+  -0.045) — measured from a crippled baseline, so they largely reflect
+  recovery from the bug rather than genuine adaptation.
+* The DNSMOS waveform-vs-spectral magnitudes (+1.536 / +0.589). That
+  comparison was *paired* — both arms shared the broken enhancer — so the
+  ranking (spectral worse, 0/8) plausibly survives, but the numbers do not.
+
+The int8/graph/on-target findings (latencies, epoch counts, the ST defect, the
+compile patches) are unaffected: none of them depend on the enhancer's audio
+quality.
+
+## The PESQ predictor: honest architecture, still exploited
+
+`pesq_predictor.py` / `pesq_adapt_eval.py`. Trained on 2,800 PESQ-labelled
+candidates from VBD train (8 deliberately varied masks per utterance: ideal
+ratio, under/over-suppression, spectral holes, band damage, random smooth),
+eco8's 181,650-parameter `MetricDiscriminator` architecture — 8x smaller than
+the DNSMOS body, `spectral_norm` throughout (Lipschitz-bounded), reading
+`(noisy_mag, enhanced_mag)` on the enhancer's own compressed magnitude.
+
+**As a predictor it is excellent**: held-out pearson **0.964**, spearman
+**0.961**, MAE **0.18 PESQ** — better than the DNSMOS adapter on a harder,
+broader distribution, with no overfitting at 40 epochs.
+
+**As a gradient source it fails, harder than the DNSMOS adapter.** On VBD
+*test* utterances with real clean references and the normalization fixed:
+
+| | value |
+|---|---:|
+| true PESQ gain | **-0.722 [95% CI ±0.128]**, improved on **0/7** |
+| optimism (believed − true) | **+5.33 PESQ** (DNSMOS adapter: +2.24 MOS) |
+
+The predictor reports **7.8–7.9** where PESQ's maximum is 4.5 — the optimizer
+drove it past the top of its own output range, i.e. clean off the distribution
+it was fit on, while true quality fell from ~3.5 to ~2.6.
+
+### What this establishes
+
+Every structural defence we could apply — an intrusive training target, the
+noisy signal as a second input so the metric judges a *relationship*, a
+Lipschitz bound by construction, and training data that deliberately includes
+the optimizer's favourite artefacts — was **not sufficient**. Learned metrics
+with 0.96 correlation on natural data are still exploitable off it, and the
+gap between correlation and steering keeps widening the harder we try:
+
+| surrogate | correlation | optimism under optimization |
+|---|---:|---:|
+| DNSMOS distilled student (FEASIBILITY.md) | spearman 0.84 | true metric worse on 77 % of clips |
+| DNSMOS spectral adapter | spearman 0.89 | +2.24 MOS |
+| PESQ predictor (this) | spearman **0.96** | **+5.33 PESQ** |
+
+Correlation on natural data is not merely insufficient — across these three it
+is **anti**-correlated with steering safety, because a better fit on the
+natural manifold buys nothing off it.
+
+The practical consequence for this project: **use the real metric as the
+gradient source, not a learned stand-in.** The full DNSMOS loss graph — with
+its own trained STFT, quantized and cropped — remains the only source in this
+repo that has demonstrably improved the true metric. That is an argument for
+finishing the on-device DNSMOS path (i.e. the ST defect) rather than replacing
+it.
