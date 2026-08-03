@@ -426,11 +426,34 @@ differentiable, so the 5.7k-parameter adapter is regressed on the three mapped
 scores it must preserve, with the metric itself frozen and bit-exact so the
 learned part cannot reshape what "quality" means.
 
-### Status
+### Score-space training, and a clean anti-correlation
 
-Zero-training bilinear resample is a usable starting point on rank
-correlation; score-space training of the correction is the current experiment.
-Neither is trustworthy as a gradient source until it passes the paired
-multi-clip protocol in `adaptation_eval.py` — rank correlation is necessary,
-not sufficient, and this architecture's whole point is to be a *gradient*
-source.
+Regressing the three mapped scores through the frozen body instead
+(`--loss score`, 5,665 trainable parameters, 30 epochs) gives the mirror image
+of the feature-MSE result:
+
+| variant | eval feature MSE | OVRL pearson | OVRL spearman | BAK spearman |
+|---|---:|---:|---:|---:|
+| bilinear, no training | 6.04 | 0.802 | 0.753 | 0.860 |
+| trained on **features** | **0.94** (6.4x better) | 0.654 | 0.510 | **0.154** |
+| trained on **scores** | 8.34 (1.4x worse) | **0.926** | **0.887** | **0.929** |
+
+The two objectives are close to anti-correlated: whichever one is optimized,
+the other degrades. Training longer overfits — at 100 epochs the training loss
+keeps falling (0.054 -> 0.027) while held-out OVRL correlation drops 0.926 ->
+0.863 and SIG collapses 0.824 -> 0.483, so the 30-epoch checkpoint is the one
+to use with this 112-clip training set.
+
+### Status: correlation reached, steering unproven
+
+`adapter_adapt_eval.py` runs the test that matters — adapt the real mask head
+with each gradient source, paired on the same held-out clips, scored with the
+official 9.01 s DNSMOS. An early 2-clip smoke run flagged the risk plainly: on
+one clip the spectral path *decreased* true OVRL (-0.133) where the waveform
+path gained +1.245. The harness reports a paired 95% CI and refuses to
+conclude when the sample cannot resolve the difference.
+
+Until that evaluation passes on a real sample size, the architecture win
+(46x less DSP, no ISTFT-adjoint, 18% fewer graph nodes) is **not** established
+as usable — a 0.93-correlation scorer that steers badly is precisely the
+failure this repo has now documented three times.
