@@ -662,3 +662,53 @@ climb and the optimizer could only descend. That does not explain the +5.33
 optimism (the predictor reporting 7.8 where PESQ maxes at 4.5), which is
 off-distribution behaviour independent of headroom. A fairer steering test
 would start from a *weaker* enhancer, where real headroom exists.
+
+## The PESQ backward: written, verified, and it isolates the ST defect further
+
+`pesq_backward.py` — a fused `(noisy_mag, enh_mag) -> (score, dScore/d(enh_mag))`
+graph with every VJP spelled out as inference ops (LearnableSigmoid, two
+Linears, PReLU, global max-pool with tie splitting, InstanceNorm's three-term
+backward, and stride-2 `Conv` input-grads via zero-insertion upsampling —
+`ConvTranspose` is outside the device vocabulary).
+
+* **Matches `torch.autograd` to 3.9e-07 relative**, first run.
+* Exports at opset 13 with torch-vs-ONNX parity **6.0e-08**.
+* Compiles: 169 epochs (13 HW / 18 hybrid / **138 SW**), 2.70 MB weights,
+  3.49 MB activations. It does *not* fit `n6-noextmem` — the zero-insertion
+  upsample materializes a 1.0 MB intermediate — so it needs `n6-allmems-O3`.
+
+### On-target: the score is exact, the gradient is garbage
+
+| candidate | score host | score **device** | gradient cosine | ratio |
+|---|---:|---:|---:|---:|
+| 3 | 3.292 | **3.292** | -0.022 | 1.6e9 |
+| 88 | 1.104 | **1.104** | 0.002 | 1.7e10 |
+| 123 | 3.647 | **3.647** | -0.005 | 6.8e10 |
+
+The score output is reproduced **exactly**; the gradient output is corrupt by
+nine to eleven orders of magnitude.
+
+### Why this matters for the bug report
+
+This is a **much cleaner reproducer than the DNSMOS one, and it is pure fp32** —
+no quantization anywhere. That kills the "int8<->float boundary" framing as the
+*sole* explanation and replaces it with something sharper:
+
+| graph | outputs | result |
+|---|---|---|
+| ConvFSENet trunk | 1 (+9 states) | correct |
+| DNSMOS forward (int8) | 2, both tiny | correct (+0.23 bias) |
+| **PESQ predictor forward** | **1 tiny** | **exact** |
+| **PESQ loss (fp32)** | 2: tiny + **64.7 kB** | **tiny exact, large corrupt** |
+| DNSMOS loss (int8) | 3: two tiny + 64 kB | all corrupt |
+
+The pattern across every graph measured this session: **a large tensor written
+as a graph output by a software epoch comes back wrong, while small outputs of
+the same inference are exact.** That holds in fp32, so it is not a quantization
+bug; quantization appears to widen the blast radius rather than cause it.
+
+That is a far more actionable statement for ST than "the int8/float boundary
+misbehaves", and the PESQ loss graph is a better attachment than the DNSMOS one:
+fp32-only, 169 epochs instead of 204, no hand-quantization, no BOOL-in-JSON
+workaround, and a self-checking pass/fail (score exact + gradient wrong in the
+same inference).
