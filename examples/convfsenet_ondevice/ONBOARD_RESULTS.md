@@ -1428,3 +1428,40 @@ problem, not a mechanism failure. Two fixes are in flight: a proper
 router was CV-fit within the 150 evaluation clips — both too few and the
 wrong split), and reverb-specific features. Until that lands, the honest
 statement is: on measured rooms the constructive result is open.
+
+### Held-out router on measured rooms: the constructive result does not recover
+
+The proper configuration — 400 VBD-*train* clips labelled on measured rooms
+(`--pool train --grid-only`), router and presets fit there once, evaluated
+once on the 150-clip test set (`--train-npz`), plus a reverb-sensitive
+feature block (sub-band decay, late/early energy, envelope kurtosis,
+centroid dynamics):
+
+| method (held-out, measured rooms) | gain | 95% CI | vs test-fit null |
+|---|---:|---:|---:|
+| global preset, test-fit (optimistic null) | +0.042 | ±0.028 | — |
+| global preset, train-fit (fair null) | +0.018 | ±0.017 | −0.024* |
+| classify → table | +0.026 | ±0.031 | −0.016 |
+| gain regression → argmax | +0.038 | ±0.025 | −0.005 |
+| table with oracle labels (transferred presets) | +0.054 | ±0.029 | +0.011 |
+| per-clip grid oracle | **+0.154** | ±0.038 | +0.111* |
+
+The router itself improved (76%, reverb detection 61% → 79% — the new
+features work). The problem has moved down a level: **the presets themselves
+barely transfer across pools.** The train pool's best reverb preset is
+(0.65, 0.0), the test set's is (0.8, 0.1), and with real-room margins this
+thin, even the oracle-LABEL table with transferred presets (+0.054) no
+longer resolves above the optimistic null. Within-kind variation now
+dominates kind-level correction (+0.154 per-clip vs +0.083 per-kind
+in-pool ceiling) — and no honest per-clip predictor reaches it.
+
+### Where this leaves the study, stated plainly
+
+On measured rooms with fair train/test splits, **no device-visible method in
+this study — learned-critic gradients, a published TTA objective, zeroth-
+order critic picks, classifier-routed presets, or gain regression — resolves
+above a trivial global preset**, while a +0.154 per-clip oracle shows the
+headroom is real. The constructive synthetic-room result was real but did
+not survive realistic acoustics; the protocol, the cautionary chain, and the
+open problem are what stand. For the paper this reads as a benchmark-and-
+protocol contribution with a demonstrated open gap, not a method paper.
