@@ -18,3 +18,4 @@ examples/convfsenet_ondevice/n6_gen/
 examples/convfsenet_ondevice/firmware_loss/loss_input.h
 ai_runner.log
 examples/convfsenet_ondevice/st_bug_report_*.tar.gz
+examples/convfsenet_ondevice/st_bug_report_*.zip

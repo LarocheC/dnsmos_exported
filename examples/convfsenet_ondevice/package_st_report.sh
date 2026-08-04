@@ -126,9 +126,12 @@ strip_ansi() { sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g'; }
   echo "host OS:           $(uname -s) $(uname -r) $(uname -m)"
 } > "$BUNDLE/environment.txt"
 
-TAR="$OUT/st_bug_report_$STAMP.tar.gz"
-tar -czf "$TAR" -C "$STAGE" "st_bug_report_$STAMP"
+# .zip rather than .tar.gz: support portals and Windows recipients open it
+# without extra tooling.
+ARCHIVE="$OUT/st_bug_report_$STAMP.zip"
+rm -f "$ARCHIVE"
+( cd "$STAGE" && zip -qr "$ARCHIVE" "st_bug_report_$STAMP" )
 rm -rf "$STAGE"
 echo
-echo "[pkg] wrote $TAR  ($(du -h "$TAR" | cut -f1))"
-tar -tzf "$TAR" | sed 's/^/       /' | head -40
+echo "[pkg] wrote $ARCHIVE  ($(du -h "$ARCHIVE" | cut -f1))"
+unzip -l "$ARCHIVE" | sed 's/^/       /' | head -40
