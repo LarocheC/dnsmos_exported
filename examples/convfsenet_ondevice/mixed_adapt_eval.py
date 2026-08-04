@@ -55,6 +55,8 @@ from pesq_predictor import PesqPredictor, compress, SR  # noqa: E402
 from reverb_adapt_eval import make_rir, reverberate  # noqa: E402
 
 SHIFTS = ("reverb", "noise", "tilt", "bandlimit")
+RIR_BANK: list | None = None      # set to a list of measured RIRs to replace
+                                  # the synthetic generator (see real_rir.py)
 GRID = [(a, f) for a in (0.5, 0.65, 0.8, 1.0, 1.25, 1.6, 2.0)
         for f in (0.0, 0.05, 0.10)]
 CPS = [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20]     # gradient checkpoints
@@ -78,8 +80,11 @@ def apply_shift(cl: np.ndarray, no: np.ndarray, kind: str,
     """
     noise = no - cl
     if kind == "reverb":
-        rt60 = float(rng.uniform(0.2, 0.6))
-        cl_rev = reverberate(cl, make_rir(rt60, rng))
+        if RIR_BANK is not None:
+            rir = RIR_BANK[int(rng.integers(len(RIR_BANK)))]
+        else:
+            rir = make_rir(float(rng.uniform(0.2, 0.6)), rng)
+        cl_rev = reverberate(cl, rir)
         return cl_rev, cl_rev + noise
     if kind == "noise":
         k = float(rng.uniform(2.0, 4.0))
@@ -110,12 +115,21 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--sisnr-floor", type=float, default=6.0)
     ap.add_argument("--sisnr-weight", type=float, default=0.5)
+    ap.add_argument("--rir-dir", type=Path, default=None,
+                    help="directory of measured RIR wavs; replaces the "
+                         "synthetic reverb generator (see real_rir.py)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=Path, default=HERE / "artifacts" / "mixed_shift.npz")
     args = ap.parse_args()
 
     torch.manual_seed(0); torch.set_num_threads(8)
     from pesq import pesq as pesq_fn
+
+    global RIR_BANK
+    if args.rir_dir is not None:
+        from real_rir import load_rirs
+        RIR_BANK = load_rirs(args.rir_dir)
+        print(f"measured RIR bank: {len(RIR_BANK)} impulse responses")
 
     models = {}
     for tag, p in (("v1", args.v1), ("v2", args.v2)):

@@ -146,6 +146,8 @@ def main() -> None:
     ap.add_argument("--seconds", type=int, default=3)
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--ridge", type=float, default=1.0)
+    ap.add_argument("--rir-dir", type=Path, default=None,
+                    help="measured RIR bank; must match how the npz was built")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -154,6 +156,11 @@ def main() -> None:
     n = len(kinds)
 
     torch.manual_seed(0); torch.set_num_threads(8)
+    if args.rir_dir is not None:
+        import mixed_adapt_eval as _mx
+        from real_rir import load_rirs
+        _mx.RIR_BANK = load_rirs(args.rir_dir)
+        print(f"measured RIR bank: {len(_mx.RIR_BANK)} impulse responses")
     trunk, head = build_split()
     sp = torch.load(args.split, map_location="cpu", weights_only=False)
     trunk.load_state_dict(sp["trunk"]); head.load_state_dict(sp["head"]); trunk.eval()

@@ -1336,3 +1336,41 @@ Details worth keeping:
 * Runtime cost: the features are a few statistics over the STFT the enhancer
   already computes, plus one 13x21 matrix multiply. No backward pass, no
   learned critic, the ST defect is irrelevant.
+
+## A published TTA method on the testbed: MPol is inert when faithful, harmful when freed
+
+`mpol_eval.py`. The protocol needs a published method, not just our own
+gradient loop. Mask Polarization (arXiv 2601.14770, IEEE OJ-SP) is the
+natural pick — lightweight, source-free, fully specified: 1-Wasserstein
+between the sorted mask entries and a bimodal reference `X_hat/(X_hat+N_hat)`
+(noise from the 32 lowest-power frames), AdamW lr 5e-4, weight ensembling
+beta 0.8. Faithfulness notes: its negative-mask penalty is identically zero
+for our sigmoid-bounded head; "normalization and output layers" reduces to
+the output layer because this trunk has no norm modules; and because their
+setting is online over a stream while ours is episodic, a GENEROUS variant
+(10x lr, no ensembling) runs alongside so the comparison cannot be a
+strawman. Same 150 mixed-shift clips, paired.
+
+| MPol variant | best step count | gain there | at 20 steps | vs null |
+|---|---:|---:|---:|---:|
+| faithful | **0 (do not run)** | +0.000 | −0.002 ±0.007 | −0.087* |
+| generous (10x lr, no ensembling) | **0 (do not run)** | +0.000 | **−0.920** ±0.114 (2% improved) | −0.087* |
+
+The faithful configuration is inert: its best fixed budget is zero steps —
+the method's optimal action on this testbed is to not execute. The generous
+configuration shows why: when the objective is allowed to move the weights,
+it is destructive (−0.49 at 5 steps, −0.92 at 20, 2% of clips improved).
+Pushing masks toward bimodality is simply the wrong correction for these
+shifts — under reverb the right move is *softening*, and polarization is its
+opposite. Both variants lose to the trivial global-preset null with
+statistical resolution; the honest router (+0.129) is not even close.
+
+For fairness: MPol's own paper reports ~+0.05 PESQ on its benchmarks, which
+would also sit below this testbed's null (+0.087) — consistent with the
+protocol's central claim rather than a contradiction of their results.
+
+Also added for the reviewer-proofing pass: `real_rir.py` loads the MIT IR
+Survey (270 measured impulse responses, rt60* median 0.42 s, 10-90%
+0.11-0.95 s), and `--rir-dir` on the testbed/router/MPol scripts swaps the
+synthetic reverb generator for measured rooms. The real-RIR replication run
+is in progress.
