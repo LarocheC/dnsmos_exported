@@ -15,7 +15,8 @@ int8<->float software-epoch defect.
 
 VJPs implemented, in reverse order:
 
-  LearnableSigmoid   y = 2*sigmoid(s*x)          -> g * 2*s*y'(1-y')
+  output head        y = sigmoid(x)              -> g * y*(1-y)
+                     y = 2*sigmoid(s*x)  (lsig)  -> g * 2*s*y'(1-y')
   Linear             y = xW^T + b                -> g @ W
   PReLU              y = max(x,0) + a*min(x,0)   -> g * (step + a*(1-step))
   global MaxPool     y = max over (H,W)          -> route to argmax via equality mask
@@ -51,7 +52,7 @@ from torch.nn import functional as F
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from pesq_predictor import PesqPredictor  # noqa: E402
+from pesq_predictor import LearnableSigmoid1d, PesqPredictor  # noqa: E402
 
 EPS_IN = 1e-5          # torch InstanceNorm2d default eps
 
@@ -115,6 +116,11 @@ class PesqLossGraph(nn.Module):
 
         enh_mag = (|X| * mask + 1e-9) ** 0.3
         d(enh_mag)/d(mask) = 0.3 * (|X| * mask + 1e-9) ** (-0.7) * |X|
+
+    Both output heads are supported. The plain sigmoid is the cheaper of the
+    two on-device: its derivative is `y*(1-y)` in the forward output that is
+    already on the wire, so the head contributes one Sub and one Mul and no
+    extra parameter.
     """
 
     def __init__(self, core: PesqPredictor) -> None:
@@ -125,7 +131,8 @@ class PesqLossGraph(nn.Module):
         self.prelus = nn.ModuleList([L[2], L[5], L[8], L[11]])
         self.fc1, self.fc2 = L[14], L[17]
         self.prelu_fc = L[16]
-        self.lsig = L[18]
+        self.out_head = L[18]
+        self.is_lsig = isinstance(L[18], LearnableSigmoid1d)
         for i, c in enumerate(self.convs):
             self.register_buffer(f"flip{i}",
                                  c.weight.detach().flip(2, 3).transpose(0, 1).contiguous())
@@ -145,11 +152,14 @@ class PesqLossGraph(nn.Module):
         a1 = self.fc1(flat)
         a1p = self.prelu_fc(a1)
         raw = self.fc2(a1p)
-        out = self.lsig(raw)
+        out = self.out_head(raw)
 
         # ---- backward: d(out)/d(enh_mag), one scalar output per batch item ----
-        g = 2.0 * self.lsig.slope * torch.sigmoid(self.lsig.slope * raw) \
-            * (1.0 - torch.sigmoid(self.lsig.slope * raw))    # LearnableSigmoid'
+        if self.is_lsig:
+            s = torch.sigmoid(self.out_head.slope * raw)
+            g = self.out_head.beta * self.out_head.slope * s * (1.0 - s)
+        else:
+            g = out * (1.0 - out)                             # sigmoid', from `out`
         g = g @ self.fc2.weight                               # fc2 VJP
         step = (torch.relu(a1) > 0).to(a1.dtype)
         g = g * (step + self.prelu_fc.weight.view(1, -1) * (1.0 - step))
@@ -165,9 +175,9 @@ class PesqLossGraph(nn.Module):
         return out.flatten(), grad_enh
 
 
-def _gate() -> None:
+def _gate_head(head: str) -> None:
     torch.manual_seed(0)
-    core = PesqPredictor(dim=8).eval()
+    core = PesqPredictor(dim=8, head=head).eval()
     for p in core.parameters():
         p.requires_grad_(False)
     # spectral_norm hooks recompute weights each forward; fold them first so the
@@ -188,11 +198,15 @@ def _gate() -> None:
 
     ref = torch.autograd.grad(out.sum(), em)[0]
     num = (grad - ref).abs().max() / ref.abs().max().clamp_min(1e-12)
-    print(f"forward out: {out.detach().numpy().round(4)}")
-    print(f"hand-written vs autograd:  max|d| {float((grad-ref).abs().max()):.3e}  "
-          f"relative {float(num):.3e}")
-    assert num < 1e-4, "backward does not match autograd"
-    print("PASS — backward matches autograd")
+    print(f"[{head:>7}] forward out {out.detach().numpy().round(4)}  "
+          f"max|d| {float((grad-ref).abs().max()):.3e}  relative {float(num):.3e}")
+    assert num < 1e-4, f"backward does not match autograd for head={head}"
+
+
+def _gate() -> None:
+    for head in ("sigmoid", "lsig"):
+        _gate_head(head)
+    print("PASS — backward matches autograd for both heads")
 
 
 if __name__ == "__main__":

@@ -790,6 +790,46 @@ plain `nn.Sigmoid` (ceiling PESQ 4.5, structural rather than enforced):
   −0.019.
 
 The clamp remains available (`--clamp`) but is no longer needed; the sigmoid
-head is the default for new models. Residual optimism of ~2 PESQ is still
-substantial and is the next thing to attack — most plausibly by training the
-predictor on reverberant candidates, which it has never seen.
+head is the default for new models.
+
+Residual optimism of ~2 PESQ is real, and the obvious lever is to train the
+predictor on reverberant candidates it has never seen. **Deliberately not
+doing that**: this is a POC of on-device adaptation, and the gap in the
+training data is the thing being adapted *for*. Close it and the adaptation
+step has nothing left to recover — the experiment would then measure the
+predictor's generalization, which is a different question. The optimism figure
+is a property of the setup, not a defect to remove.
+
+### The sigmoid head on target: same result, one epoch cheaper
+
+Switching heads changed the backward, which hardcoded the LearnableSigmoid's
+`slope` and would have crashed on the new checkpoint. `PesqLossGraph` now
+branches on the head, and the plain sigmoid is the cheaper of the two: its
+derivative is `y*(1-y)` in the forward output already on the wire, so the head
+costs one `Sub` and one `Mul` and no parameter. Both heads gate against
+autograd at **3.9e-07**.
+
+Re-exported, recompiled for `n6-noextmem`, flashed, and run
+(`run_pesq_on_target.py`, now tracked — the previous on-target run was ad hoc):
+
+| | epochs | HW / hybrid / SW | total |
+|---|---:|---|---:|
+| lsig head | 35 | 12 / 0 / 23 | 727 kB |
+| **sigmoid head** | **33** | **12 / 0 / 21** | 739 kB |
+
+| candidate | true PESQ | host int8 | **device** | \|d\| |
+|---|---:|---:|---:|---:|
+| 3 | 3.19 | 2.95 | **2.95** | 0.000 |
+| 17 | 4.14 | 3.54 | **3.52** | 0.015 |
+| 42 | 2.14 | 2.84 | **2.86** | 0.018 |
+| 88 | 1.10 | 1.13 | **1.13** | 0.003 |
+| 123 | 3.79 | 3.29 | **3.29** | 0.000 |
+| 260 | 3.49 | 2.39 | **2.39** | 0.000 |
+
+**device vs host int8: mean 0.0060 PESQ, max 0.018, at 37.6 ms/inference** —
+identical latency to the lsig build, and the output spans 1.13..3.52, so it is
+tracking its input rather than returning the DNSMOS loss graph's constant. The
+head swap costs nothing on target.
+
+The gradient half of this graph still hits the ST large-output defect; that is
+unchanged by the head and remains blocked on the ticket.

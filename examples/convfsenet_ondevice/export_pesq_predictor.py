@@ -108,7 +108,8 @@ def main() -> None:
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    core = PesqPredictor(ck["dim"])
+    # checkpoints predating the head switch have no "head" key and are all lsig
+    core = PesqPredictor(ck["dim"], ck.get("head", "lsig"))
     core.load_state_dict(ck["model"])
     core.eval()
     print(f"removed {strip_spectral_norm(core)} spectral_norm parametrizations")
