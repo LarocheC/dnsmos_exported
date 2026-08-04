@@ -1247,3 +1247,41 @@ classify-then-preset table wins; nowhere does the gradient loop win. The
 salvageable positives: the deployment stack itself, the calibration/
 exploitation decomposition, the bystander-judge mechanism, and the testbed
 design criterion — a study whose value is the map of why, not a method.
+
+## Capacity or direction? Two knobs settle it
+
+`two_knob_adapt.py`. The mixed-shift failure invites the objection that
+adapting only the 49k-parameter mask head was too little, or the wrong,
+capacity. Strongest possible test of that objection: reduce adaptation to
+TWO scalars, `m = sigmoid(t*z + c)` with the head's logits `z` frozen — a
+family that *contains* the known reverb fix (t~0.5 softens like m^0.5, c>0
+raises the floor). Nothing here can be "too small"; there is almost nothing
+to exploit; the right answer is on the table. Same 150 paired reverberant
+clips.
+
+| within the same 2-parameter family | gain | 95% CI | improved |
+|---|---:|---:|---:|
+| fixed (t=0.5, c=0.5) | **+0.731** | ±0.078 | 94% |
+| per-clip (t,c) oracle | +0.868 | ±0.080 | 99% |
+| critic-steered, step 5 | −0.089 | ±0.047 | 35% |
+| critic-steered, step 40 | **−0.244** | ±0.082 | 27% |
+
+And where the critic drives the knobs (truth wants t~0.5, c>0):
+
+| step | mean t | mean c |
+|---:|---:|---:|
+| 0 | 1.000 | +0.000 |
+| 10 | 1.071 | −0.102 |
+| 40 | **1.117** | **−0.345** |
+
+**Both knobs, turned the wrong way.** Holding exactly the two parameters
+that contain a +0.73 fix, the critic hardens the mask (t up) and deepens the
+suppression floor (c down), losing −0.244 — monotonically worse with more
+steps. Capacity is exonerated conclusively: the 49k-parameter loop never
+lacked the winning direction (the preset is ~`W,b -> 0.5W, 0.5b`, inside its
+space all along); it lacked a critic that knew which way "better" was.
+
+Corollary for the "adapt more parameters" instinct: with a miscalibrated
+compass, capacity multiplies damage — every extra dimension is another
+direction to be steered wrong in. The mixed testbed already showed the 49k
+version at −0.42 on the noise shift; two parameters merely lose −0.24.
