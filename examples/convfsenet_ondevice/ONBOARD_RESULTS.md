@@ -1184,3 +1184,66 @@ constructive finding: one round of offline replay produces a judge that stays
 honest along the attacker's trajectory — it is just that on this testbed there
 is nothing worth judging. Worth re-testing if a valid testbed (no global
 preset fix) ever shows adaptation winning.
+
+## The mixed-shift testbed: adaptation is finally needed — and the learned loop still can't deliver it
+
+`mixed_adapt_eval.py`. The testbed the reverb study said was required: 150
+clips, each drawing ONE of four shifts whose corrections conflict — reverb
+(wants a softer mask), noise at 2-4x (wants a harder one), noise re-coloring,
+telephone-ish bandlimit (wants ~identity). Null hypothesis: the best single
+global preset, fit on the test set itself.
+
+**Validity holds.** The null collapses from reverb-only's +0.641 to
+**+0.087 ±0.043** (52% improved), and its per-kind signs conflict as designed
+(+0.481 on reverb, −0.064 noise, −0.079 tilt, +0.002 bandlimit). Meanwhile the
+per-clip grid oracle is +0.221 — for the first time, genuinely per-clip
+decisions have real headroom (+0.135) over any constant.
+
+| method | gain | 95% CI | improved | vs null |
+|---|---:|---:|---:|---:|
+| global preset (null, test-fit) | +0.087 | ±0.043 | 52% | — |
+| global preset, cross-validated | +0.087 | ±0.043 | 52% | ±0.000 |
+| per-kind preset table, cross-validated | **+0.166** | ±0.057 | 59% | **+0.079** |
+| per-clip grid oracle | +0.221 | ±0.053 | 91% | +0.135 |
+| v1 zeroth-order pick | −0.132 | ±0.032 | 19% | −0.219 |
+| v2 zeroth-order pick | −0.045 | ±0.025 | 38% | −0.131 |
+| **gradient v1, 10 steps** | **−0.170** | ±0.055 | 28% | −0.256 |
+| gradient + oracle stop | +0.056 | ±0.017 | 78% | −0.030 |
+| judge accept/reject | −0.054 | ±0.033 | 19% | −0.140 |
+
+Per-kind, the gradient loop: reverb +0.106, noise **−0.420 (0% improved)**,
+tilt −0.214, bandlimit −0.151.
+
+### Three conclusions, and this closes the arc
+
+**1. The learned-critic loop fails precisely where adaptation is finally
+justified.** On the testbed with real per-clip headroom, gradient adaptation
+is *harmful* overall (−0.170), harmful on three of four shifts, and its
+ceiling with PERFECT per-clip stopping (+0.056) still loses to a single
+global constant (+0.087). This is no longer "marginal gain, below JND" — it
+is the wrong sign, including on the noise shift, which is the critic's own
+training noise merely made louder.
+
+**2. What actually works is discrete, not continuous.** A per-kind preset
+table with honestly cross-validated presets (+0.166) captures 75% of the
+per-clip oracle, needing only a 4-way domain decision — and the four shifts
+are acoustically distinct enough that a trivial classifier is plausible.
+Classify-then-preset beats optimize-against-a-judge everywhere we measured.
+
+**3. The reverb result was not an unlucky testbed; it was the lucky one.**
+Under reverb the critic's errors happened to point somewhere harmless enough
+that the trust region could salvage +0.083. Under the noise shift the same
+loop destroys −0.420. The learned critic is not a noisy compass; off its
+training distribution it is a compass pointing wrong, with confidence.
+
+### The study's final shape
+
+Adaptation-by-learned-metric on a frozen edge device fails for three
+independent, now-measured reasons: the critic saturates under optimization
+(instant, 276x), its failures cannot be patched offline (moving target), and
+its steering is miscalibrated off-distribution even zeroth-order (backwards
+ranking). Where shifts are simple a preset wins; where shifts conflict a
+classify-then-preset table wins; nowhere does the gradient loop win. The
+salvageable positives: the deployment stack itself, the calibration/
+exploitation decomposition, the bystander-judge mechanism, and the testbed
+design criterion — a study whose value is the map of why, not a method.
