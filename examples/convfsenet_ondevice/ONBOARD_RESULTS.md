@@ -1000,3 +1000,81 @@ outputs by running this adaptation loop during dataset construction, label them
 with real PESQ, and train the predictor to score them correctly. The critic is
 still frozen at deployment; the anti-exploitation training simply happens
 before the flash. That is untested here and is the obvious next experiment.
+
+## Offline replay does not substitute for online replay — the experiment failed
+
+`pesq_adv_dataset.py`. The saturation finding suggested a fix compatible with a
+frozen on-device critic: MetricGAN's replay buffer solves exactly this problem
+but *online*, which an MCU cannot do, so do the same augmentation **offline**.
+Run the adaptation loop during dataset construction, capture the masks it
+produces, label them with real PESQ, and train the predictor to score them
+correctly. Critic still frozen at deployment; only the anti-exploitation
+training moves before the flash.
+
+Built: 2,240 adversarial candidates from 224 anechoic VBD *train* utterances
+(5 capture points x 2 trust-region settings), appended to the original 2,800.
+Reverb was deliberately excluded — it is the held-out shift the whole
+adaptation experiment exists to recover. The exploits were exactly the region
+the hand-designed `candidate_masks` misses:
+
+| capture step | true PESQ | v1 believed | gap |
+|---:|---:|---:|---:|
+| 1 | 2.75 | 4.07 | +1.32 |
+| 10 | 2.41 | 4.45 | +2.04 |
+| 100 | 2.09 | 4.50 | **+2.40** |
+
+### It did not work
+
+| | v1 (natural) | v2 (+ replay) |
+|---|---:|---:|
+| **belief std across clips, step 0** | 0.2640 | 0.3477 |
+| **belief std across clips, step 100** | 0.0010 | 0.0015 |
+| **std collapse** | **276x** | **230x** |
+| frac > 4.45 at step 100 | 100% | 100% |
+| calibration error at step 0 | +1.483 | **+1.010** |
+| exploitation at max budget | +0.902 | **+1.371** |
+| best fixed budget | **+0.083** ±0.032 | +0.063 ±0.031 |
+| oracle stopping | +0.178 | +0.156 |
+| best gating rule (CV) | 1% of headroom | 4% of headroom |
+| natural-data pearson (jointly held out, n=83) | **+0.961** | +0.951 |
+
+The mechanism is untouched: v2 still collapses to a constant, still pins every
+clip above 4.45 by step 100. The adaptation gain went *down*, exploitation went
+*up*, and natural-data accuracy paid a small price (MAE 0.182 -> 0.220).
+
+### Why — and this is the useful part
+
+**Exploitation is defined relative to the critic being attacked.** Training v2
+on v1's exploits inoculates it against v1's blind spots; the optimizer then
+finds v2's, which are different ones. v2 starts *lower* (3.087 vs 3.560, the
+calibration win) and still climbs to the same 4.495 ceiling, so it actually has
+further to travel — hence more measured exploitation, not less.
+
+This makes MetricGAN's alternation **essential rather than incidental**. The
+target moves as the critic changes, so a fixed number of offline rounds cannot
+converge on a moving target; only tracking it can. One round was never going to
+be enough, but the failure is not "needs more rounds" — each round redefines
+what an exploit is.
+
+The one thing offline replay did buy is real and worth keeping: **baseline
+calibration improved from +1.483 to +1.010**, and it did so on *reverberant*
+audio that the augmentation never contained. That gives a clean dichotomy:
+
+* **static errors** — being wrong about a distortion type never seen — are
+  fixable offline, and generalize across shifts
+* **adaptive errors** — being wrong about whatever an optimizer is currently
+  producing — are not, because the error is a function of the attacker
+
+### What this means for the direction
+
+The frozen-critic constraint is **fundamental, not an engineering
+inconvenience**. It cannot be trained away offline. So on-device metric-driven
+adaptation with a learned critic is capped near the fixed-budget **+0.083 PESQ**
+measured earlier — below the PESQ JND — unless the objective itself changes to
+something that cannot be exploited by construction (a non-learned signal-domain
+criterion), or the device gains the ability to update its critic online, which
+is the thing the hardware forbids.
+
+That is a negative result about the approach, established at n=150 with
+cross-validated rules and a mechanism that explains it, rather than an
+engineering gap waiting to be closed.
