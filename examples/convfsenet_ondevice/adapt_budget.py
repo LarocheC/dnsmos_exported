@@ -76,6 +76,13 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--predictor", type=Path,
                     default=HERE / "artifacts" / "pesq_predictor_sig.pt")
+    ap.add_argument("--judge", type=Path, default=None,
+                    help="second predictor, recorded per checkpoint but NEVER "
+                         "differentiated through. Exploits are critic-specific "
+                         "(the offline-replay result), so a judge with different "
+                         "blind spots may stay discriminative along the attacker's "
+                         "trajectory — especially one *trained on* that attacker's "
+                         "exploits, for which the trajectory is in-distribution.")
     ap.add_argument("--split", type=Path, default=HERE / "artifacts" / "convfsenet_split.pt")
     ap.add_argument("--clips", type=int, default=100)
     ap.add_argument("--seconds", type=int, default=4)
@@ -100,6 +107,14 @@ def main() -> None:
     for p in metric.parameters():
         p.requires_grad_(False)
 
+    judge = None
+    if args.judge is not None:
+        cj = torch.load(args.judge, map_location="cpu", weights_only=False)
+        judge = PesqPredictor(cj["dim"], cj.get("head", "lsig")).eval()
+        judge.load_state_dict(cj["model"])
+        for p in judge.parameters():
+            p.requires_grad_(False)
+
     trunk, head = build_split()
     sp = torch.load(args.split, map_location="cpu", weights_only=False)
     trunk.load_state_dict(sp["trunk"]); head.load_state_dict(sp["head"]); trunk.eval()
@@ -113,6 +128,7 @@ def main() -> None:
     n, nc = len(pairs), len(cps)
     true = np.full((n, nc), np.nan)          # real PESQ at each checkpoint
     bel = np.full((n, nc), np.nan)           # what the predictor claimed
+    jud = np.full((n, nc), np.nan)           # what the judge said (if any)
     snr = np.full((n, nc), np.nan)           # SI-SNR vs the reverberant input
     rt60s = np.zeros(n)
 
@@ -158,7 +174,10 @@ def main() -> None:
                 full = torch.cat([m, torch.zeros(1, m.shape[1])], 0)
                 est = synth(full)
                 k = idx[step]
-                bel[i, k] = float(metric(nmag_c[None], compress(Xt * full)[None])[0]) * 3.5 + 1.0
+                emag = compress(Xt * full)[None]
+                bel[i, k] = float(metric(nmag_c[None], emag)[0]) * 3.5 + 1.0
+                if judge is not None:
+                    jud[i, k] = float(judge(nmag_c[None], emag)[0]) * 3.5 + 1.0
                 snr[i, k] = float(si_snr(est, noisy_t))
                 try:
                     true[i, k] = pesq_fn(SR, ref, est.numpy().astype(np.float32), "wb")
@@ -184,8 +203,9 @@ def main() -> None:
             print(f"  {i+1:3d}/{n} clips  ({el:.0f}s, {el/(i+1):.1f}s/clip, "
                   f"eta {el/(i+1)*(n-i-1)/60:.1f} min)", flush=True)
 
+    extra = {"judged": jud} if judge is not None else {}
     np.savez_compressed(args.out, true=true, believed=bel, sisnr=snr,
-                        steps=np.array(cps), rt60=rt60s)
+                        steps=np.array(cps), rt60=rt60s, **extra)
 
     # ---------------- aggregate ----------------
     # every statistic here is paired across steps, so a clip is only usable if
@@ -194,7 +214,7 @@ def main() -> None:
     if not ok.all():
         print(f"\ndropped {int((~ok).sum())} clip(s) with a failed PESQ call; "
               f"{int(ok.sum())} complete trajectories remain")
-    true, bel, snr = true[ok], bel[ok], snr[ok]
+    true, bel, snr, jud = true[ok], bel[ok], snr[ok], jud[ok]
 
     base = true[:, 0]
     gain = true - base[:, None]
@@ -237,6 +257,18 @@ def main() -> None:
     peaked = mean_curve[-1] < mean_curve[kbest] - 1.96 * se_f
     print(f"\n=> mean true PESQ {'PEAKS then declines' if peaked else 'does not resolve a peak'}"
           f"; exploitation at max budget {excess[:,-1].mean():+.3f} PESQ")
+
+    if judge is not None:
+        # the two numbers that decide whether the judge idea is alive: does it
+        # keep discriminating (std) and does it keep tracking truth (r)?
+        print("\njudge along the attacker's trajectory "
+              "(vs the attacked metric's own view):")
+        print(f"{'step':>5} {'attacked std':>13} {'judge std':>10} "
+              f"{'judge r(true)':>14} {'judge-true':>11}")
+        for k, s in enumerate(cps):
+            r = np.corrcoef(jud[:, k], true[:, k])[0, 1]
+            print(f"{s:>5} {bel[:,k].std():13.4f} {jud[:,k].std():10.4f} "
+                  f"{r:>+14.3f} {(jud[:,k]-true[:,k]).mean():+11.3f}")
     print(f"saved trajectories to {args.out}")
 
 

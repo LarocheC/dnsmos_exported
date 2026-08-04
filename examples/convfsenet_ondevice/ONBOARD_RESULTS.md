@@ -1078,3 +1078,69 @@ is the thing the hardware forbids.
 That is a negative result about the approach, established at n=150 with
 cross-validated rules and a mechanism that explains it, rather than an
 engineering gap waiting to be closed.
+
+## Gate 0: the classical baseline — and the static preset that ends the premise
+
+`classical_baseline.py`. Before building further on the +0.083 learned-critic
+result, the question that should have been asked first: can classical adaptive
+DSP match it? Same 150 clips, same RIRs (identical rng draw order — every
+number paired), all methods starting from the enhancer's shipped output.
+
+| method | gain | 95% CI | improved |
+|---|---:|---:|---:|
+| decision-directed Wiener post-filter | −0.545 | ±0.046 | 0% |
+| rescale grid, SI-SNR-floor pick | −0.302 | ±0.072 | 20% |
+| rescale grid, v1 zeroth-order pick | −0.327 | ±0.042 | 7% |
+| rescale grid, v2 zeroth-order pick | −0.142 | ±0.045 | 33% |
+| rescale grid, **oracle pick** | **+0.687** | ±0.051 | 100% |
+| *(reference: gradient loop, fixed 10 steps)* | *+0.083* | *±0.032* | *70%* |
+| *(reference: gradient loop, oracle stop)* | *+0.178* | *±0.029* | *88%* |
+
+Read as designed, Gate 0 *passes*: every device-pickable classical method is
+negative, and the gradient loop's +0.083 survives as the only positive
+device-visible adaptation. But the oracle column gives the game away twice.
+
+**First: the grid oracle is +0.687 — 4x anything gradient adaptation can
+reach even with perfect stopping.** And its picks are nearly constant:
+`a=0.5, f=0.1` (soften the mask, floor the suppression) on 113/150 clips. So
+apply that one setting globally, with no selection at all:
+
+| static preset | gain | 95% CI | improved |
+|---|---:|---:|---:|
+| **a=0.5, f=0.1** | **+0.641** | ±0.062 | **95%** |
+| a=0.65, f=0.1 | +0.534 | ±0.045 | 97% |
+| a=0.5, f=0.05 | +0.606 | ±0.058 | 95% |
+
+**A fixed global mask-softening captures 93% of the per-clip oracle and beats
+the entire learned-critic apparatus 8-fold.** The reverb shift's damage is a
+*systematic* miscalibration — the enhancer over-suppresses under reverb — and
+one knob corrects it for 95% of clips. No labels, no critic, no gradient, no
+per-clip decisions.
+
+**Second: the learned critics rank the family backwards.** Zeroth-order
+selection over 21 near-manifold candidates — no gradient, no saturation, the
+setting where a critic should be safest — picks `a=2` (MORE suppression, 57 of
+150 clips) and lands at −0.327. Truth wants `a=0.5`. The critics, trained on
+anechoic VBD where suppression is good, prefer exactly the wrong direction
+under reverb; the gradient loop's meagre +0.083 was won *against* its own
+metric's preference, presumably via the trust region. This also kills the
+"zeroth-order use is safe" hypothesis: the critic is not just exploitable
+under optimization, it is *miscalibrated in ranking* off-distribution.
+
+### What Gate 0 actually decides
+
+The premise dies, but not the way the gate anticipated. Classical *adaptive*
+methods lose; a classical *static correction* wins overwhelmingly. The honest
+statement:
+
+> On this testbed, the domain shift is too simple to justify adaptation. Any
+> shift whose correction is expressible as a global preset will be won by the
+> preset; test-time adaptation can only justify itself under shifts whose
+> correction varies per clip, per user, or per device — and this one does not.
+
+Which retroactively reframes the whole reverb line: the +0.083 was never
+"adaptation working under domain shift"; it was adaptation clawing back a
+sliver of a fix that a constant knob delivers 8x better. The correct
+evaluation for on-device adaptation needs a shift with no global fix —
+speaker-specific, device-specific, or multi-condition mixtures where the
+preset that helps one clip hurts another.

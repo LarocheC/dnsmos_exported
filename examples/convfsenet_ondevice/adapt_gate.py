@@ -40,12 +40,12 @@ HERE = Path(__file__).resolve().parent
 # Each returns, per clip, the index into `steps` at which to stop.
 # Signature: (bel, snr, t) -> int array of checkpoint indices.
 
-def rule_fixed(bel, snr, t):
+def rule_fixed(bel, snr, jud, t):
     """Adapt every clip for the same number of steps. The baseline."""
     return np.full(len(bel), int(t))
 
 
-def rule_belief_rise(bel, snr, t):
+def rule_belief_rise(bel, snr, jud, t):
     """Stop once the metric has climbed `t` PESQ above where it started.
 
     Rationale: the belief rise is the visible part of exploitation. Capping it
@@ -55,7 +55,7 @@ def rule_belief_rise(bel, snr, t):
     return _first_true(rise >= t)
 
 
-def rule_saturation(bel, snr, t):
+def rule_saturation(bel, snr, jud, t):
     """Stop when the metric stops moving — marginal gain per step below `t`.
 
     Rationale: the budget curve shows belief pinning near its ceiling almost
@@ -66,7 +66,7 @@ def rule_saturation(bel, snr, t):
     return _first_true(d < t, skip_first=True)
 
 
-def rule_headroom_gate(bel, snr, t):
+def rule_headroom_gate(bel, snr, jud, t):
     """Adapt only clips whose starting belief is below `t`; others get 0 steps.
 
     Rationale: 10% of clips are best left alone. If the metric already thinks a
@@ -77,7 +77,7 @@ def rule_headroom_gate(bel, snr, t):
     return np.where(bel[:, 0] < t, k10, 0)
 
 
-def rule_sisnr_drift(bel, snr, t):
+def rule_sisnr_drift(bel, snr, jud, t):
     """Stop once the output has moved `t` dB in SI-SNR from where it started.
 
     Rationale: a purely signal-domain trust region, needing no reference and
@@ -97,6 +97,38 @@ def _first_true(mask, skip_first=False):
     return idx
 
 
+def rule_judge_drop(bel, snr, jud, t):
+    """Stop when the judge's belief falls `t` below its running max.
+
+    The judge is never differentiated through, so if it stays discriminative
+    along the attacker's trajectory, its decline marks real degradation the
+    attacked metric can no longer see. Online: uses only past checkpoints.
+    """
+    runmax = np.maximum.accumulate(jud, axis=1)
+    return _first_true(runmax - jud >= t)
+
+
+def rule_divergence(bel, snr, jud, t):
+    """Stop when attacker-judge divergence grows `t` beyond its step-0 value.
+
+    Divergence growth is a direct exploitation estimate: the attacked metric
+    inflates while a differently-blind judge does not follow.
+    """
+    div = (bel - jud) - (bel[:, :1] - jud[:, :1])
+    return _first_true(div >= t)
+
+
+def rule_judge_accept(bel, snr, jud, t):
+    """Run the fixed 10 steps, then keep or revert by the judge's verdict.
+
+    Not a stopping rule but an accept/reject gate: if the judge thinks the
+    clip got at least `t` better, keep the adaptation; otherwise roll back to
+    step 0 (free on device — the pre-adaptation weights are still in flash).
+    """
+    k10 = 8
+    return np.where(jud[:, k10] - jud[:, 0] >= t, k10, 0)
+
+
 RULES = [
     ("fixed budget",        rule_fixed,          None),
     ("belief-rise cap",     rule_belief_rise,    np.arange(0.1, 1.6, 0.05)),
@@ -105,13 +137,22 @@ RULES = [
     ("SI-SNR drift cap",    rule_sisnr_drift,    np.arange(0.1, 4.0, 0.1)),
 ]
 
+JUDGE_RULES = [
+    ("judge drop",          rule_judge_drop,     np.arange(0.02, 0.8, 0.02)),
+    ("divergence cap",      rule_divergence,     np.arange(0.05, 1.5, 0.05)),
+    # the judge's own level drifts down as its calibration error shrinks along
+    # the trajectory, so "kept the clip at least as good" sits at a negative
+    # threshold; the grid must reach well below zero
+    ("judge accept/reject", rule_judge_accept,   np.arange(-1.2, 0.5, 0.05)),
+]
 
-def evaluate(rule, gain, bel, snr, t):
-    k = rule(bel, snr, t)
+
+def evaluate(rule, gain, bel, snr, jud, t):
+    k = rule(bel, snr, jud, t)
     return gain[np.arange(len(gain)), k]
 
 
-def cross_val(rule, grid, gain, bel, snr, folds, rng):
+def cross_val(rule, grid, gain, bel, snr, jud, folds, rng):
     """Pick the threshold on training folds, score on the held-out fold."""
     n = len(gain)
     order = rng.permutation(n)
@@ -122,10 +163,12 @@ def cross_val(rule, grid, gain, bel, snr, folds, rng):
         tr = np.setdiff1d(order, te)
         best_t, best_v = grid[0], -np.inf
         for t in grid:
-            v = evaluate(rule, gain[tr], bel[tr], snr[tr], t).mean()
+            v = evaluate(rule, gain[tr], bel[tr], snr[tr],
+                         None if jud is None else jud[tr], t).mean()
             if v > best_v:
                 best_t, best_v = t, v
-        out[te] = evaluate(rule, gain[te], bel[te], snr[te], best_t)
+        out[te] = evaluate(rule, gain[te], bel[te], snr[te],
+                           None if jud is None else jud[te], best_t)
         chosen.append(best_t)
     return out, chosen
 
@@ -140,8 +183,10 @@ def main() -> None:
 
     z = np.load(args.npz)
     true, bel, snr, steps = z["true"], z["believed"], z["sisnr"], z["steps"]
+    jud = z["judged"] if "judged" in z else None
     ok = ~np.isnan(true).any(axis=1)
     true, bel, snr = true[ok], bel[ok], snr[ok]
+    jud = None if jud is None else jud[ok]
     gain = true - true[:, :1]
     n = len(true)
     rng = np.random.default_rng(args.seed)
@@ -159,6 +204,10 @@ def main() -> None:
         "SI-SNR at step 0": snr[:, 0],
         "SI-SNR drift by step 10": snr[:, 8] - snr[:, 0],
     }
+    if jud is not None:
+        feats["judge at step 0"] = jud[:, 0]
+        feats["judge rise by step 10"] = jud[:, 8] - jud[:, 0]
+        feats["divergence rise by 10"] = (bel[:, 8] - jud[:, 8]) - (bel[:, 0] - jud[:, 0])
     print("do device-visible signals predict the oracle stopping point?")
     print(f"{'signal':>26} {'r vs best step':>15} {'r vs oracle gain':>18}")
     for k, v in feats.items():
@@ -170,14 +219,16 @@ def main() -> None:
     print(f"{'rule':>20} {'gain':>9} {'95% CI':>9} {'improved':>9} {'vs fixed':>10} {'thresholds':>22}")
 
     fixed_grid = np.arange(len(steps))
-    base, base_t = cross_val(rule_fixed, fixed_grid, gain, bel, snr, args.folds, rng)
+    base, base_t = cross_val(rule_fixed, fixed_grid, gain, bel, snr, jud,
+                             args.folds, rng)
     rows = []
-    for name, fn, grid in RULES:
+    active = RULES + (JUDGE_RULES if jud is not None else [])
+    for name, fn, grid in active:
         if grid is None:
             g, ts = base, [steps[int(t)] for t in base_t]
         else:
             rng2 = np.random.default_rng(args.seed)      # identical folds
-            g, ts = cross_val(fn, grid, gain, bel, snr, args.folds, rng2)
+            g, ts = cross_val(fn, grid, gain, bel, snr, jud, args.folds, rng2)
         d = g - base
         se = g.std(ddof=1) / np.sqrt(n)
         se_d = d.std(ddof=1) / np.sqrt(n) if grid is not None else float("nan")
