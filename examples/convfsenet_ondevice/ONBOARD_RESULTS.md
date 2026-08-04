@@ -924,3 +924,79 @@ Ablating the SI-SNR floor (`--no-sisnr`), same 150 clips:
   a broader condition set than the single value used before, but it is one
   family, not real rooms.
 * Single enhancer, single seed, one shift type.
+
+## The oracle headroom is not reachable: the metric saturates into a constant
+
+`adapt_gate.py`. The budget curve left +0.094 PESQ between the best fixed
+budget (+0.083) and oracle per-clip stopping (+0.178). The hypothesis was that
+the metric's own trajectory — how fast it pins to its ceiling — would flag
+clips being exploited, at zero extra compute.
+
+**It does not, and no other device-visible signal does either.** Admissible
+signals are only those the edge actually has: the predictor's output, and
+SI-SNR against the *noisy* input (not clean, but free). True PESQ is oracle-only.
+
+| signal | r vs optimal step | r vs oracle gain |
+|---|---:|---:|
+| believed at step 0 | +0.023 | +0.140 |
+| belief rise by step 2 | +0.003 | −0.117 |
+| belief rise by step 10 | −0.018 | −0.148 |
+| SI-SNR at step 0 | −0.079 | −0.180 |
+| SI-SNR drift by step 10 | +0.058 | +0.163 |
+
+Nothing correlates with where a clip should stop. Five rules, each with its
+threshold **cross-validated** (fit on training folds, scored held-out, the
+fixed budget given the same treatment so the comparison is fair):
+
+| rule | gain | 95% CI | improved | vs fixed |
+|---|---:|---:|---:|---:|
+| fixed budget | +0.082 | ±0.033 | 69% | — |
+| belief-rise cap | +0.030 | ±0.032 | 61% | −0.052* |
+| belief saturation | +0.067 | ±0.035 | 71% | −0.015* |
+| headroom gate | +0.083 | ±0.032 | 69% | +0.001 |
+| SI-SNR drift cap | +0.048 | ±0.038 | 60% | −0.034* |
+| never adapt | +0.000 | — | 0% | −0.082 |
+| *oracle (not a rule)* | *+0.178* | *±0.029* | *88%* | *+0.096* |
+
+`*` = paired difference resolves at 95%. The best rule captures **1%** of the
+headroom — the headroom gate simply degenerates to the fixed budget, since its
+fitted threshold (4.15) fires for nearly every clip.
+
+### Why: the signal's variance collapses while the outcome's does not
+
+| step | believed: mean | **std across clips** | frac > 4.45 |
+|---:|---:|---:|---:|
+| 0 | 3.560 | **0.2640** | 0% |
+| 1 | 4.094 | 0.1559 | 0% |
+| 4 | 4.402 | 0.0424 | 9% |
+| 10 | 4.455 | 0.0350 | 76% |
+| 25 | 4.487 | 0.0078 | 100% |
+| 100 | 4.498 | 0.0010 | 100% |
+
+The metric's spread across clips falls **250x**, to 0.001 PESQ, while the true
+outcome at step 10 still has std 0.202 and ranges −0.78 to +0.59. By step 25
+every clip sits within 0.05 of the 4.50 ceiling. The predictor has become a
+constant function of its input.
+
+That is the same mechanism as the instantaneous exploitation seen in the budget
+curve, and it forecloses a whole family of solutions: **a saturating metric
+cannot serve as its own stopping criterion**, because at the moment you need it
+to discriminate, it has stopped discriminating. 12% of clips have oracle gain
+<= 0 — they should never be adapted — and nothing visible identifies them.
+
+### What this implies
+
+Realistic ceiling for this configuration is the fixed-budget **+0.083 PESQ**,
+which is below the ~0.1–0.2 PESQ JND. Adaptation works, is statistically
+resolved, and is perceptually marginal. Making it matter needs a metric that
+*retains resolution off its training manifold* — a different design criterion
+from the correlation-on-natural-data that metrics are normally selected for,
+and one that this project's earlier surrogate comparisons never tested.
+
+There is a concrete route that stays compatible with a frozen on-device critic.
+MetricGAN's replay buffer fixes exactly this, but *online*, which an MCU cannot
+do. The same augmentation can be applied **offline**: generate exploited
+outputs by running this adaptation loop during dataset construction, label them
+with real PESQ, and train the predictor to score them correctly. The critic is
+still frozen at deployment; the anti-exploitation training simply happens
+before the flash. That is untested here and is the obvious next experiment.
