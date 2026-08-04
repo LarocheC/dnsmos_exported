@@ -1144,3 +1144,43 @@ sliver of a fix that a constant knob delivers 8x better. The correct
 evaluation for on-device adaptation needs a shift with no global fix —
 speaker-specific, device-specific, or multi-condition mixtures where the
 preset that helps one clip hurts another.
+
+## Exp 1 for the record: the judge stays awake, and it still doesn't matter
+
+`adapt_budget.py --judge`. Run after Gate 0 had already decided the premise,
+to complete the record: gradient from v1, v2 recorded per checkpoint but never
+differentiated through.
+
+The mechanism hypothesis was **confirmed**:
+
+| step | attacked std | judge std | judge r(true) | judge−true |
+|---:|---:|---:|---:|---:|
+| 0 | 0.2640 | 0.3477 | +0.538 | +1.010 |
+| 10 | 0.0350 | **0.4165** | +0.663 | +0.243 |
+| 100 | 0.0010 | **0.4109** | +0.686 | **+0.021** |
+
+While the attacked metric collapses 264x, the judge's spread across clips
+*grows*, its correlation with truth *improves* (0.54 → 0.69), and its
+calibration error vanishes (+1.01 → +0.02) — the trajectory walks INTO v2's
+training distribution (v1-exploits are exactly what v2 was trained on).
+Exploits being critic-specific cuts both ways, exactly as predicted.
+
+And yet the cross-validated stopping rules built on it still lose:
+
+| rule | gain | vs fixed |
+|---|---:|---:|
+| fixed budget | +0.082 ±0.033 | — |
+| judge drop | +0.054 | −0.028* |
+| divergence cap | +0.056 | −0.026* |
+| judge accept/reject | +0.064 | −0.018 |
+
+A discriminative, well-calibrated judge (r = 0.69) is still too weak an
+instrument for a per-clip stopping decision whose signal is ±0.1 PESQ of
+trajectory curvature. The oracle headroom (+0.096) remains uncaptured; the
+mechanism was necessary but not sufficient.
+
+The don't-differentiate-through-the-judge principle survives as the one
+constructive finding: one round of offline replay produces a judge that stays
+honest along the attacker's trajectory — it is just that on this testbed there
+is nothing worth judging. Worth re-testing if a valid testbed (no global
+preset fix) ever shows adaptation winning.
