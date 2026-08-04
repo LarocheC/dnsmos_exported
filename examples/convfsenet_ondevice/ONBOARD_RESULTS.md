@@ -1374,3 +1374,57 @@ Survey (270 measured impulse responses, rt60* median 0.42 s, 10-90%
 0.11-0.95 s), and `--rir-dir` on the testbed/router/MPol scripts swaps the
 synthetic reverb generator for measured rooms. The real-RIR replication run
 is in progress.
+
+## Measured rooms: every negative result replicates; the router result does not
+
+The full chain re-run with the MIT IR Survey's 270 measured impulse responses
+(`--rir-dir`, `real_rir.py`) replacing the synthetic reverb generator. Same
+protocol, n=150.
+
+**Real rooms are gentler than the synthetic tails.** The reverb baseline
+rises from 1.96 to 2.38 PESQ, the reverb preset direction is unchanged
+(soften + floor) but its size drops from +0.670 to **+0.277** (a=0.8, f=0.1),
+and every headroom number roughly halves:
+
+| | synthetic RIRs | measured RIRs |
+|---|---:|---:|
+| global preset null | +0.087 | +0.042 |
+| per-kind table, oracle labels | +0.176 | +0.083 |
+| per-clip grid oracle | +0.221 | +0.154 |
+
+So Gate 0's qualitative claim survives (a preset still beats everything on
+the reverb kind by a wide margin) but its headline magnitude was partly a
+synthetic-severity artifact; +0.28, not +0.64, is the honest reverb number.
+
+**All the negative results replicate, some more strongly:**
+
+| method (measured RIRs) | gain | improved | vs null |
+|---|---:|---:|---:|
+| gradient v1, 10 steps | **−0.197** | 19% | −0.239 |
+| gradient + oracle stop | +0.040 | 73% | −0.003 |
+| v1 zeroth-order pick | −0.104 | 25% | −0.146 |
+| judge accept/reject | −0.054 | 13% | −0.096 |
+| MPol (faithful, best budget) | 0 steps | — | −0.037* |
+
+The gradient loop is slightly *worse* on real rooms; the noise-kind
+catastrophe (−0.415, 3%) is unchanged; MPol's best budget is again zero. The
+paper's cautionary claims are robust to real acoustics.
+
+**The constructive result is the casualty.** Router accuracy falls from 77%
+to 71% — reverb detection collapses from 87% to 61%, because real reverb is
+acoustically subtler than exponential tails and the features were implicitly
+tuned on the synthetic signature:
+
+| honest routers (measured RIRs) | gain | vs null |
+|---|---:|---:|
+| classify → table | +0.037 | −0.005 |
+| gain regression → argmax | +0.050 | +0.007 (unresolved) |
+
+With margins halved and reverb detection at 61%, the router no longer beats
+the null. The mechanism still has signal — the oracle-label table stays
+resolved above the null (+0.083, +0.040*) — so this is a router-quality
+problem, not a mechanism failure. Two fixes are in flight: a proper
+400-clip training pool drawn from VBD *train* utterances (the current
+router was CV-fit within the 150 evaluation clips — both too few and the
+wrong split), and reverb-specific features. Until that lands, the honest
+statement is: on measured rooms the constructive result is open.

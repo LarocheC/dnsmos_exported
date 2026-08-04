@@ -63,6 +63,37 @@ CPS = [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20]     # gradient checkpoints
 K10 = CPS.index(10)
 
 
+def load_train_pairs(n: int, seconds: int, seed: int = 7):
+    """(clean, noisy) pairs from VBD *train* shards — for fitting routers.
+
+    The router must never be fit on test utterances; this mirrors
+    `load_test_pairs` but draws from the training shards.
+    """
+    import io
+    import pyarrow.parquet as pq
+    import soundfile as sf
+    from pesq_predictor import VBD
+
+    rng = np.random.default_rng(seed)
+    seg = seconds * SR
+    out = []
+    for shard in sorted(VBD.glob("train-*.parquet")):
+        tbl = pq.ParquetFile(str(shard)).read()
+        for i in rng.permutation(len(tbl)):
+            if len(out) >= n:
+                return out
+            row = tbl.slice(int(i), 1).to_pylist()[0]
+            cl, _ = sf.read(io.BytesIO(row["clean"]["bytes"]), dtype="float32")
+            no, _ = sf.read(io.BytesIO(row["noisy"]["bytes"]), dtype="float32")
+            m = min(len(cl), len(no))
+            if m < seg:
+                continue
+            st = (m - seg) // 2
+            out.append((cl[st:st + seg].astype(np.float64),
+                        no[st:st + seg].astype(np.float64)))
+    return out
+
+
 def lowpass_fir(fc_hz: float, sr: int = SR, taps: int = 101) -> np.ndarray:
     """Windowed-sinc lowpass, linear phase."""
     n = np.arange(taps) - (taps - 1) / 2
@@ -115,6 +146,12 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--sisnr-floor", type=float, default=6.0)
     ap.add_argument("--sisnr-weight", type=float, default=0.5)
+    ap.add_argument("--grid-only", action="store_true",
+                    help="skip the gradient loop; enough for router labels")
+    ap.add_argument("--pool", choices=("test", "train"), default="test",
+                    help="which VBD split supplies the utterances; 'train' "
+                         "builds a router-fitting pool that shares nothing "
+                         "with the evaluation clips")
     ap.add_argument("--rir-dir", type=Path, default=None,
                     help="directory of measured RIR wavs; replaces the "
                          "synthetic reverb generator (see real_rir.py)")
@@ -145,7 +182,8 @@ def main() -> None:
     sp = torch.load(args.split, map_location="cpu", weights_only=False)
     trunk.load_state_dict(sp["trunk"]); head.load_state_dict(sp["head"]); trunk.eval()
 
-    pairs = load_test_pairs(args.clips, args.seconds)
+    pairs = (load_test_pairs(args.clips, args.seconds) if args.pool == "test"
+             else load_train_pairs(args.clips, args.seconds, seed=args.seed + 7))
     rng = np.random.default_rng(args.seed)
     win = torch.from_numpy(dsp.hann_periodic()).float()
 
@@ -205,6 +243,12 @@ def main() -> None:
                     bel_grid[tag][i, j] = float(m_(nmag_c[None], emag)[0])
 
         # ---- the gradient loop (v1), judge recorded ----
+        if args.grid_only:
+            g_step[i] = 0.0; jud_step[i] = 0.0
+            if (i + 1) % 20 == 0:
+                el = time.time() - t0
+                print(f"  {i+1:3d}/{n}  ({el:.0f}s)", flush=True)
+            continue
         W = head.conv.weight.detach()[:, :, 0].clone().requires_grad_(True)
         bb = head.conv.bias.detach().clone().requires_grad_(True)
         opt = torch.optim.Adam([W, bb], lr=args.lr)
@@ -294,7 +338,9 @@ def main() -> None:
     np.savez_compressed(args.out, kinds=kinds, base=base, g_grid=g_grid,
                         g_step=g_step, jud_step=jud_step, steps=np.array(CPS),
                         bel_v1=bel_grid["v1"], bel_v2=bel_grid["v2"],
-                        grid=np.array(GRID))
+                        grid=np.array(GRID),
+                        meta=np.array([args.pool, str(args.seconds),
+                                       str(args.seed), str(args.clips)]))
     print(f"\nsaved {args.out}")
 
 
