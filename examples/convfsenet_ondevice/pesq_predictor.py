@@ -78,10 +78,27 @@ class LearnableSigmoid1d(nn.Module):
 
 
 class PesqPredictor(nn.Module):
-    """(noisy_mag, enhanced_mag) [B, 2, F, T] -> normalized PESQ in [0, 2]."""
+    """(noisy_mag, enhanced_mag) [B, 2, F, T] -> normalized PESQ.
 
-    def __init__(self, dim: int = 16) -> None:
+    `head="sigmoid"` (default) bounds the output to (0, 1), i.e. PESQ 1..4.5 —
+    the range the metric can actually mean. `head="lsig"` reproduces eco8's
+    `LearnableSigmoid1d(beta=2)`, which reaches 2.0 == **PESQ 8.0**.
+
+    That headroom is not harmless. Used as a gradient source, the optimizer
+    drove the lsig model to 7.8 — chasing a score no PESQ computation can
+    return — and the adaptation had to be rescued with an external clamp. A
+    plain sigmoid makes the ceiling structural: the gradient vanishes at the
+    top of the valid range because there is nowhere further to go.
+
+    (The bound costs nothing real: PESQ tops out at 4.64 for a perfect match,
+    so a sigmoid gives up only the last 0.14, which no enhancer reaches.)
+    """
+
+    def __init__(self, dim: int = 16, head: str = "sigmoid") -> None:
         super().__init__()
+        if head not in ("sigmoid", "lsig"):
+            raise ValueError(f"head must be 'sigmoid' or 'lsig', got {head!r}")
+        self.head = head
         self.layers = nn.Sequential(
             spectral_norm(nn.Conv2d(2, dim, (4, 4), (2, 2), (1, 1), bias=False)),
             nn.InstanceNorm2d(dim, affine=True), nn.PReLU(dim),
@@ -94,7 +111,7 @@ class PesqPredictor(nn.Module):
             nn.AdaptiveMaxPool2d(1), nn.Flatten(),
             spectral_norm(nn.Linear(dim * 8, dim * 4)), nn.Dropout(0.3), nn.PReLU(dim * 4),
             spectral_norm(nn.Linear(dim * 4, 1)),
-            LearnableSigmoid1d(1),
+            LearnableSigmoid1d(1) if head == "lsig" else nn.Sigmoid(),
         )
 
     def forward(self, noisy_mag: torch.Tensor, enh_mag: torch.Tensor) -> torch.Tensor:
@@ -214,8 +231,10 @@ def train(args) -> None:
     print(f"{n} candidates: {len(tr)} train / {len(ev)} eval, "
           f"PESQ {La.min()*3.5+1:.2f}..{La.max()*3.5+1:.2f}")
 
-    model = PesqPredictor(args.dim)
-    print(f"PesqPredictor: {sum(p.numel() for p in model.parameters()):,} params")
+    model = PesqPredictor(args.dim, args.head)
+    ceiling = (2.0 if args.head == "lsig" else 1.0) * 3.5 + 1.0
+    print(f"PesqPredictor({args.head}): {sum(p.numel() for p in model.parameters()):,} "
+          f"params, output ceiling PESQ {ceiling:.1f}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     Xe = torch.from_numpy(Fa[ev]).float(); Ye = torch.from_numpy(La[ev])
 
@@ -242,7 +261,7 @@ def train(args) -> None:
             mae, r, rs = ev_stats()
             print(f"  epoch {ep+1:3d}  train MSE {tot/len(order):.5f}  "
                   f"eval MAE {mae:.3f} PESQ  pearson {r:+.3f}  spearman {rs:+.3f}")
-    torch.save({"model": model.state_dict(), "dim": args.dim}, args.out)
+    torch.save({"model": model.state_dict(), "dim": args.dim, "head": args.head}, args.out)
     print(f"saved {args.out}")
 
 
@@ -262,6 +281,8 @@ def main() -> None:
     t.add_argument("--batch", type=int, default=16)
     t.add_argument("--lr", type=float, default=1e-3)
     t.add_argument("--dim", type=int, default=16)
+    t.add_argument("--head", choices=("sigmoid", "lsig"), default="sigmoid",
+                   help="output nonlinearity; see PesqPredictor")
     t.add_argument("--out", type=Path, default=HERE / "artifacts" / "pesq_predictor.pt")
     t.set_defaults(func=train)
     args = ap.parse_args()

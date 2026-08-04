@@ -764,3 +764,32 @@ adaptation loop does what it was built to do.
 * The clamp is a *brake*, not a fix — it stops the optimizer chasing impossible
   scores, but the metric is still over-reporting by 2.64 PESQ inside the
   allowed range.
+
+### The LearnableSigmoid was the problem — a plain sigmoid replaces the clamp
+
+eco8's `LearnableSigmoid1d(beta=2)` can emit **PESQ 8.0**, nearly double what
+the metric can mean, and the optimizer went straight for it. Retrained with a
+plain `nn.Sigmoid` (ceiling PESQ 4.5, structural rather than enforced):
+
+| variant | correlation | adaptation gain | improved | optimism |
+|---|---:|---:|---:|---:|
+| lsig, unclamped | 0.964 / 0.961 | −0.054 ±0.125 | 3/7 | +5.72 |
+| lsig + external clamp | 0.964 / 0.961 | **+0.164** ±0.091 | **7/7** | +2.64 |
+| **plain sigmoid, no clamp** | 0.959 / 0.955 | **+0.120** ±0.080 | 6/7 | **+2.14** |
+
+* **Correlation is unaffected** (0.959/0.955 vs 0.964/0.961 — within noise), so
+  the extra output range was pure liability. The concern that `lsig`'s
+  learnable slope also controls sharpness did not materialize.
+* **The bound is now structural.** No clamp, no tuning parameter, and the
+  gradient vanishes at the top of the valid range because there is nowhere
+  further to go.
+* **Lowest optimism of the three (+2.14)** — the architectural fix beats the
+  external guard on the metric that matters for exploitation.
+* The gain, +0.120 [±0.080], is statistically resolved and within noise of the
+  clamped lsig's +0.164; 6/7 rather than 7/7, with the one regression at
+  −0.019.
+
+The clamp remains available (`--clamp`) but is no longer needed; the sigmoid
+head is the default for new models. Residual optimism of ~2 PESQ is still
+substantial and is the next thing to attack — most plausibly by training the
+predictor on reverberant candidates, which it has never seen.

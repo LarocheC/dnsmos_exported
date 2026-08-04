@@ -84,7 +84,7 @@ def main() -> None:
     from pesq import pesq as pesq_fn
 
     ck = torch.load(args.predictor, map_location="cpu", weights_only=False)
-    metric = PesqPredictor(ck["dim"]).eval()
+    metric = PesqPredictor(ck["dim"], ck.get("head", "lsig")).eval()
     metric.load_state_dict(ck["model"])
     for p in metric.parameters():
         p.requires_grad_(False)
