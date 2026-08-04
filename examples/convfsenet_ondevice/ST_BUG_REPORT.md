@@ -1,24 +1,41 @@
-# ST Edge AI Core 4.0.1 / Neural-ART: int8↔float software-epoch boundary produces wrong results (and hangs) on STM32N6570-DK
+# ST Edge AI Core 4.0.1 / Neural-ART: large graph outputs written by software epochs are corrupted (STM32N6570-DK)
 
-**Summary.** A quantized ONNX graph that contains a large fp32 elementwise
-region between int8 convolution blocks compiles cleanly and executes on the
-STM32N657 NPU, but returns results that **do not depend on the input**. Two
-different input clips produce **bit-identical** outputs, and the fp32 output
-tensor contains words such as `0x808080F2` — i.e. int8 zero-point bytes
-(`0x80` = −128) appearing inside a float32 buffer — plus NaNs. A larger
-instance of the same graph **hangs** on a pure-software `DequantizeLinear`
-epoch and never returns.
+**Summary.** On multi-output networks, a **large output tensor produced by a
+software epoch comes back corrupted**, while small outputs of the *same
+inference* are bit-exact. We have a **pure-fp32 reproducer** in which one
+inference returns a correct scalar and, simultaneously, a 64.7 kB gradient
+tensor wrong by nine to eleven orders of magnitude.
 
-ST's own optimized export of the same model (`*_OE_*.onnx`, emitted by
-`stedgeai generate`) is **numerically correct** when executed on the host with
-onnxruntime, so the ONNX graph and the front-end transformation are both
-sound. The defect appears in code generation or in the LL_ATON runtime's
-handling of the int8/float boundary in software epochs.
+The same failure at int8 is more severe: outputs become entirely
+input-independent (two different inputs give bit-identical results), the fp32
+buffer contains `0x808080F2` words — int8 zero-point bytes (`0x80` = −128)
+inside a float32 tensor — plus NaNs, and a larger instance **hangs** on a
+pure-software `DequantizeLinear` and never returns.
 
-We have reproduced the failure through **two independent host→device paths**
-(the `NPU_Validation` protobuf stack, and a bare LL_ATON runner with the input
-baked into the firmware image), across **four compiler configurations**. A
-minimal, self-contained reproducer is attached.
+ST's own optimized export of each model (`*_OE_*.onnx`, emitted by `stedgeai
+generate`) is **numerically correct** when run on the host with onnxruntime, so
+the ONNX graph and the front-end transformation are both sound. The defect is
+in code generation or in the LL_ATON runtime.
+
+Reproduced through **two independent host→device paths** (the `NPU_Validation`
+protobuf stack, and a bare LL_ATON runner with the input baked into the
+firmware image) and across **four compiler configurations**. Two self-contained
+reproducers are attached; **§3a (fp32) is the one we suggest starting from** —
+it is quantization-free and self-checking.
+
+### Evidence across every network we measured
+
+| network | outputs | on-target result |
+|---|---|---|
+| ConvFSENet trunk (int8, streaming) | 1 small (+9 state tensors) | correct, 4.24 ms |
+| PESQ predictor forward (int8) | 1 small | **exact** (0.006 PESQ vs host) |
+| DNSMOS forward (int8) | 2, both small | correct within a +0.23 bias |
+| **PESQ loss graph (fp32)** | small scalar + **64.7 kB** | **scalar exact, large tensor corrupt** |
+| DNSMOS loss graph (int8) | 2 small + 64 kB | all outputs corrupt |
+| DNSMOS loss graph, 1 s (int8) | 2 small + 256 kB | **hangs** |
+
+The discriminating variable is not quantization — the fp32 case fails too — but
+the presence of a **large output tensor emitted by a software epoch**.
 
 ---
 
@@ -59,7 +76,35 @@ Two instances, identical topology, differing only in window length:
 Note the high pure-software epoch count (125): the fp32 elementwise region is
 executed on the Cortex-M55, and that is exactly where both symptoms appear.
 
-## 3. Defect A — output does not depend on the input (0.25 s instance)
+## 3a. PRIMARY REPRODUCER (fp32, no quantization) — large output corrupted, small output exact
+
+A fused "score + gradient" network: a small CNN (4x [Conv2d stride 2,
+InstanceNorm, PReLU], global max-pool, 2 Linear layers) followed by a
+hand-written backward pass expressed as ordinary inference operators. **No
+quantization anywhere** — plain float32 throughout.
+
+* Inputs: `noisy_mag [1,257,63]`, `enh_mag [1,257,63]` (float32)
+* Outputs: `score [1]` (float32) and `grad_enh [1,257,63]` (float32, 64.7 kB)
+* Compiled with `--st-neural-art n6-allmems-O3`: 169 epochs
+  (13 HW / 18 hybrid / **138 SW**), 2.70 MB weights, 3.49 MB activations.
+
+Host reference is onnxruntime on the same ONNX file; the graph also matches
+`torch.autograd` to 3.9e-07, so both outputs are known-good.
+
+| input | `score` host | `score` **device** | `grad_enh` cosine vs host | \|grad_dev\| / \|grad_host\| |
+|---|---:|---:|---:|---:|
+| A | 3.292 | **3.292** | −0.022 | 1.6e9 |
+| B | 1.104 | **1.104** | 0.002 | 1.7e10 |
+| C | 3.647 | **3.647** | −0.005 | 6.8e10 |
+
+**Both outputs come from the same inference call.** The scalar is exact to the
+printed precision on every probe; the large tensor is uncorrelated with the
+truth and its magnitude is wrong by 9–11 orders of magnitude.
+
+This is the cleanest statement of the defect we can give: same run, same
+memory, one output right and one wrong, no quantization involved.
+
+## 3. Defect A — output does not depend on the input (0.25 s instance, int8)
 
 ### 3.1 Reproduction
 
@@ -180,19 +225,34 @@ large fp32 elementwise / dequantize region rather than to the model family.
 
 ## 6. Working hypothesis
 
-The `0x808080F2` words in a float32 output buffer suggest that a tensor which
-should be dequantized to float32 is instead being read as raw int8 (or that a
-buffer descriptor's element type / stride is wrong) at the int8→float boundary
-of a software epoch. That would explain both the input-independent scores
-(downstream epochs computing on a constant, zero-point-filled tensor) and the
-non-finite gradient. The hang in Defect B occurs at the first
-`DequantizeLinear` of the same region, which fits the same root cause with a
-larger buffer.
+The discriminating factor across all six networks is **a large output tensor
+written by a software epoch**, not quantization: the fp32 reproducer (§3a)
+fails with no quantization present, and every network whose outputs are all
+small is correct.
+
+We suspect the output buffer for a large software-epoch result is either not
+committed to the address the runtime reports, or is committed with the wrong
+stride/type/size — so the host reads uninitialized or partially-written memory.
+Consistent observations:
+
+* The wrong values are not merely inaccurate but **structurally wrong**:
+  magnitudes 1e9–1e11 too large (fp32 case), and in the int8 case raw
+  `0x80` zero-point bytes appearing inside a float32 buffer plus NaNs.
+* In the int8 case the corruption is **non-deterministic** between runs of the
+  identical firmware and input (non-finite count moved 176 → 460 and
+  491 → 1304), which points to stale/uninitialized memory rather than
+  arithmetic error, while the small outputs stay bit-stable.
+* The hang (Defect B) occurs when the same region's buffer grows to 256 kB.
+
+Quantization appears to widen the blast radius — at int8 the small outputs are
+corrupted too — rather than to be the cause.
 
 ## 7. Attachments
 
 | file | contents |
 |---|---|
+| `pesq_loss_fp32.onnx` | **primary fp32 reproducer (§3a)** — no quantization |
+| `pesq_predictor_int8.onnx` | the same network without the backward: 1 small output, runs **correctly** on target (control) |
 | `crop0p25s_int8_d2_rows_dev.onnx` | deployable ONNX, Defect A |
 | `crop1s_int8_d2_rows_dev2.onnx` | deployable ONNX, Defect B (hang) |
 | `gen_025_*/` | four `stedgeai generate` outputs (`-O3`, `-O1`, no-cache-opt, `--Opreserve-inputs`): `network.c`, `*_OE_*.onnx`, `*_Q.json`, `network_generate_report.txt` |
@@ -203,14 +263,17 @@ larger buffer.
 
 ## 8. Questions for ST
 
-1. Is the int8→float32 boundary in **pure-software epochs** known to be
-   affected in ST Edge AI Core 4.0.1 / LL_ATON v1.1.3, particularly for graphs
-   with many (>100) software epochs and multi-MB fp32 intermediate tensors?
+1. Is there a known limitation on **large output tensors produced by software
+   epochs** in ST Edge AI Core 4.0.1 / LL_ATON v1.1.3 — a maximum size, an
+   alignment requirement, or a required cache/commit step beyond
+   `LL_ATON_Cache_MCU_Invalidate_Range` on the reported output address? The
+   fp32 reproducer in §3a needs no quantization to trigger it.
 2. Is there a supported way to force the fp32 elementwise region onto a path
    that avoids this — a compiler flag, an epoch-splitting hint, or a different
    `--st-neural-art` profile?
-3. Is a multi-output network (here 3 outputs, one of which is the same size as
-   an input) subject to any constraint we may have violated?
+3. Are multi-output networks subject to any constraint we may have violated,
+   particularly when outputs differ greatly in size (here 4 B and 64.7 kB from
+   the same inference)?
 4. Can you confirm whether the `epoch_65` `DequantizeLinear` hang (Defect B) is
    the same root cause, or should it be tracked separately?
 

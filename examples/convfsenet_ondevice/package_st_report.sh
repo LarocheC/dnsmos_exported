@@ -16,6 +16,9 @@ mkdir -p "$BUNDLE"
 
 echo "[pkg] report + reproducer sources"
 cp "$HERE/ST_BUG_REPORT.md" "$BUNDLE/"
+for f in pesq_backward.py pesq_predictor.py export_pesq_predictor.py; do
+  [ -f "$HERE/$f" ] && cp "$HERE/$f" "$BUNDLE/"
+done
 mkdir -p "$BUNDLE/firmware_loss"
 cp "$HERE/firmware_loss/orchestrator_loss.c" \
    "$HERE/firmware_loss/build_and_run.sh" \
@@ -24,6 +27,11 @@ cp "$HERE/firmware_loss/orchestrator_loss.c" \
 
 echo "[pkg] deployable ONNX artifacts"
 mkdir -p "$BUNDLE/models"
+# Primary reproducer first: fp32, no quantization, self-checking (one output
+# exact and one corrupt in the same inference), plus its forward-only control
+# which runs correctly on the same silicon.
+cp "$HERE/artifacts/pesq_loss_fp32.onnx"      "$BUNDLE/models/" 2>/dev/null || true
+cp "$HERE/artifacts/pesq_predictor_int8.onnx" "$BUNDLE/models/" 2>/dev/null || true
 cp "$HERE/artifacts_crop/crop0p25s_int8_d2_rows_dev.onnx" "$BUNDLE/models/"
 cp "$HERE/artifacts_crop/crop1s_int8_d2_rows_dev2.onnx"   "$BUNDLE/models/"
 
@@ -43,6 +51,8 @@ copy_gen "$HERE/n6_gen/dnsmos_loss_crop0p25s_O1"            "gen_025_O1"
 copy_gen "$HERE/n6_gen/dnsmos_loss_crop0p25s_nocache"       "gen_025_nocacheopt"
 copy_gen "$HERE/n6_gen/dnsmos_loss_crop0p25s_preserve"      "gen_025_preserve_inputs"
 copy_gen "$HERE/n6_gen/dnsmos_loss_crop1s_int8_d2"          "gen_1s_hang"
+copy_gen "$HERE/n6_gen/pesq_loss"                          "gen_pesq_loss_fp32"
+copy_gen "$HERE/n6_gen/pesq_n6-noextmem"                   "gen_pesq_forward_control"
 
 echo "[pkg] UART capture"
 for f in /tmp/loss_uart.txt /tmp/loss_uart2.txt; do
