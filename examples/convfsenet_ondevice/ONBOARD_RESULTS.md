@@ -712,3 +712,55 @@ misbehaves", and the PESQ loss graph is a better attachment than the DNSMOS one:
 fp32-only, 169 epochs instead of 204, no hand-quantization, no BOOL-in-JSON
 workaround, and a self-checking pass/fail (score exact + gradient wrong in the
 same inference).
+
+---
+
+## On-device adaptation DOES help — under domain shift, with the metric clamped
+
+`reverb_adapt_eval.py`. The negative PESQ result on VoiceBank-DEMAND was the
+wrong test: ConvFSENet is a PESQ metric-GAN *trained on VBD*, so it starts near
+its optimum and an optimizer can only walk downhill. Adaptation is for
+conditions the model never saw. Reverberant noisy speech is one — VBD contains
+none.
+
+Reference is the **reverberant clean** signal (reverb kept, noise removed): a
+denoiser cannot dereverberate, so scoring against the anechoic clean would
+charge it for a task it was never given.
+
+The shift is real: it costs the shipped enhancer **1.040 PESQ** (3.3–3.9
+anechoic → 1.95–2.63 reverberant). Headroom now exists.
+
+| | mean gain | improved on | optimism |
+|---|---:|---:|---:|
+| VBD (no headroom, unclamped) | **−0.722** ±0.128 | 0/7 | +5.30 |
+| reverb (headroom, unclamped) | −0.054 ±0.125 | 3/7 | +5.72 |
+| **reverb, metric clamped at PESQ 4.5** | **+0.164 ±0.091** | **7/7** | +2.64 |
+
+Two independent effects, cleanly separated:
+
+* **Headroom stops the losses.** VBD's −0.72 (resolved) becomes −0.05 (not
+  resolved) once the enhancer is off its training distribution. The user's
+  hypothesis was right, and necessary — but not sufficient on its own.
+* **Clamping unlocks the gains.** The predictor's `LearnableSigmoid(beta=2)`
+  can emit up to **PESQ 8.0**, and the optimizer drove it to 7.8 — chasing a
+  score the metric cannot mean. Capping it at PESQ 4.5 makes the gradient
+  vanish once the claim becomes unjustifiable, which halves the optimism
+  (+5.72 → +2.64) and turns the gain positive and unanimous.
+
+**+0.164 PESQ on 7/7 clips, 95% CI excluding zero**, from adapting 49,408
+parameters against a metric the project owns, on features the enhancer already
+computes. That is the first resolved evidence in this repo that the on-device
+adaptation loop does what it was built to do.
+
+### Honest limits
+
+* The predictor was trained only on **non-reverberant** VBD, so under reverb it
+  is doubly off-distribution; the residual +2.64 optimism is unsurprising and
+  retraining with reverberant candidates is the obvious next step.
+* Synthetic RIRs (exponentially-decaying noise) create the shift but are not
+  acoustically exact; real RIRs would strengthen the claim.
+* 7 utterances, one RIR family, one rt60. The CI is honest for that sample but
+  the sample is small.
+* The clamp is a *brake*, not a fix — it stops the optimizer chasing impossible
+  scores, but the metric is still over-reporting by 2.64 PESQ inside the
+  allowed range.
