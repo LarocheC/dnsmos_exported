@@ -833,3 +833,94 @@ head swap costs nothing on target.
 
 The gradient half of this graph still hits the ST large-output defect; that is
 unchanged by the head and remains blocked on the ticket.
+
+## The adaptation budget curve: the optimum is ~10 steps, not 40
+
+`adapt_budget.py`. Every adaptation run before this used a fixed 40 steps,
+chosen arbitrarily. MetricGAN's premise is that a frozen surrogate's gradient
+"is only accurate for the first few learning iterations", and their fix —
+retrain the surrogate alternately — **is unavailable on an MCU**: the predictor
+is frozen in flash, there are no labels at the edge, and there is no room for a
+second training loop. So the qualitative warning has to become a number.
+
+150 reverberant VBD test clips (3 s, rt60 drawn per clip in [0.2, 0.6]),
+true PESQ against the **reverberant clean** reference at each step count.
+
+| step | true PESQ | gain | 95% CI | improved | exploitation |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 2.077 | — | — | — | +0.000 |
+| 1 | 2.096 | +0.018 | ±0.006 | 77% | +0.516 |
+| 4 | 2.129 | +0.051 | ±0.020 | 76% | +0.790 |
+| **10** | **2.161** | **+0.083** | **±0.032** | **70%** | +0.812 |
+| 20 | 2.152 | +0.075 | ±0.041 | 62% | +0.847 |
+| 40 | 2.134 | +0.057 | ±0.046 | 57% | +0.876 |
+| 100 | 2.113 | +0.036 | ±0.047 | 55% | +0.902 |
+
+### Four findings
+
+**1. The curve peaks and declines.** The optimum is ~10 steps. The 40-step
+protocol used everywhere earlier gives up ~30% of the available gain (+0.057
+vs +0.083) and drops the improved-clip rate from 70% to 57%. It is not
+catastrophic — an earlier 30-clip run at 4 s suggested 40 steps was actually
+*negative*, which the larger sample does not support — but it is clearly
+suboptimal, and the peak location is now measured rather than assumed.
+
+**2. Most of the "optimism" was never Goodhart.** Splitting it:
+
+* **calibration error at step 0: +1.483 PESQ** — the predictor is wrong about
+  reverberant audio it never saw, before any optimizer acts
+* **exploitation: +0.90 PESQ at maximum budget** — the part adaptation created
+
+The headline "+2.14 optimism" quoted earlier was ~62% calibration error. These
+have different fixes (training data vs. frozen-critic control) and quoting the
+sum overstated how compromised the metric is.
+
+**3. Exploitation is near-instantaneous, not gradual.** +0.52 after a *single*
+step, then a slow creep to +0.90 over the remaining 99. The natural reading of
+MetricGAN's "accurate for the first few iterations" — as gradual degradation —
+does not describe what happens here. The first step moves the output off the
+predictor's manifold and the metric pins near its ceiling (4.50 of a possible
+4.50) almost immediately; what declines afterwards is true quality drifting
+while the metric has nothing left to say.
+
+**4. A fixed budget captures about half of what is available.**
+
+| stopping rule | gain |
+|---|---:|
+| best fixed budget (10 steps) | +0.083 |
+| oracle per-clip | **+0.178** |
+| headroom for a better rule | +0.094 |
+
+Per-clip optimum: median 10, IQR 4–30, 10–90% **0–81**. The 10th percentile
+being 0 means for at least a tenth of clips the correct action is *not to adapt
+at all*. A cheap on-device gating/stopping rule has ~+0.09 PESQ to compete for
+— more than the fixed-budget gain itself.
+
+### The trust region raises the peak but does not create it
+
+Ablating the SI-SNR floor (`--no-sisnr`), same 150 clips:
+
+| | peak step | gain at peak | gain at 100 | exploitation@100 | SI-SNR drift |
+|---|---:|---:|---:|---:|---|
+| trust region ON | 10 | **+0.083** ±0.032 | +0.036 | +0.902 | 7.91 → 9.30 |
+| trust region OFF | 10 | +0.051 ±0.028 | −0.009 | +0.947 | 7.91 → 7.28 |
+
+* **The peak survives the ablation at the same step count**, so the budget
+  effect is the metric's own behaviour, not an artifact of the constraint. The
+  budget is the real control variable.
+* The trust region is worth **+0.032 PESQ** at the peak and keeps the tail from
+  going negative.
+* It barely changes *exploitation* (+0.90 vs +0.95) — it constrains the output,
+  not the metric's belief. It limits the damage, not the fooling.
+
+### Honest limits
+
+* **+0.083 PESQ is statistically resolved but perceptually marginal** — below
+  the ~0.1–0.2 usually taken as a PESQ JND. 30% of clips still get worse at the
+  optimal budget. The oracle +0.178 would matter; the fixed budget arguably
+  does not. Capturing that headroom is the thing that decides whether this
+  line is worth pursuing.
+* RIRs remain synthetic exponentially-decaying noise. Varying rt60 per clip is
+  a broader condition set than the single value used before, but it is one
+  family, not real rooms.
+* Single enhancer, single seed, one shift type.
