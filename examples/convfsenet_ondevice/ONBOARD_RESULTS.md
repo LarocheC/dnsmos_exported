@@ -1285,3 +1285,54 @@ Corollary for the "adapt more parameters" instinct: with a miscalibrated
 compass, capacity multiplies damage — every extra dimension is another
 direction to be steered wrong in. The mixed testbed already showed the 49k
 version at −0.42 on the noise shift; two parameters merely lose −0.24.
+
+## The first honest win: feature-routed presets beat the null, end to end
+
+`knob_router.py`. Classify-then-preset had assumed the 4-way domain label;
+this closes the gap with two fully device-visible routers, trained on the
+per-preset gains already measured in `mixed_shift.npz`, everything (router
+weights, presets, thresholds) fit on train folds only:
+
+* **classify -> table** — multinomial logistic over 13 classical DSP features
+  (envelope autocorrelation, modulation depth, noise-floor level/tilt,
+  spectral rolloff, the enhancer's own mask statistics and SI-SNR) predicts
+  the kind; the per-kind table is applied to the *predicted* label.
+* **gain regression -> argmax** — ridge predicts each of the 21 presets'
+  gains from the same features; apply the per-clip argmax. No discrete label;
+  ceiling is the per-clip oracle rather than the table.
+
+| method (all CV, n=150 mixed) | gain | 95% CI | improved | vs null |
+|---|---:|---:|---:|---:|
+| gradient loop (v1, 10 steps) | −0.170 | ±0.055 | 28% | −0.256 |
+| global preset (null) | +0.087 | ±0.043 | 52% | — |
+| classify → table, honest | +0.126 | ±0.058 | 55% | **+0.039\*** |
+| **gain regression → argmax, honest** | **+0.129** | ±0.056 | 56% | **+0.043\*** |
+| per-kind table, oracle labels | +0.176 | ±0.057 | 68% | +0.089\* |
+| per-clip grid oracle | +0.221 | ±0.053 | 91% | +0.135\* |
+
+`*` = paired difference vs the null resolves at 95%.
+
+**This is the first fully honest, device-computable mechanism in the study
+that beats the best global constant with statistical resolution** — and it is
+thirteen hand-crafted DSP features and a ridge regression, fit offline
+against real PESQ. Against the learned-critic gradient loop on the same
+clips, the swing is +0.30 PESQ.
+
+Details worth keeping:
+
+* Router accuracy is 77% (reverb 87%, bandlimit 100%, noise/tilt confused —
+  harmlessly, since those two kinds share the same best preset). The gap to
+  the oracle-label table (+0.176) is pure router accuracy; the gap from there
+  to +0.221 is within-kind refinement. Both are ordinary supervised-learning
+  engineering — more features, more training clips — not research risk, which
+  is the structural difference from the critic path.
+* The most informative features are modulation depth and lag-4 envelope
+  autocorrelation (reverb dynamics), the top-octave noise floor, and —
+  notably — `sisnr0`, how far the enhancer already moved the signal: the
+  enhancer's own behaviour is itself a usable domain sensor.
+* A confidence fallback (commit to the kind preset only when the router is
+  sure, else the global preset) adds nothing here (+0.127) — the fitted
+  thresholds go low, i.e. committing is already the right call at 77%.
+* Runtime cost: the features are a few statistics over the STFT the enhancer
+  already computes, plus one 13x21 matrix multiply. No backward pass, no
+  learned critic, the ST defect is irrelevant.
