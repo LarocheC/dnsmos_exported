@@ -1465,3 +1465,47 @@ headroom is real. The constructive synthetic-room result was real but did
 not survive realistic acoustics; the protocol, the cautionary chain, and the
 open problem are what stand. For the paper this reads as a benchmark-and-
 protocol contribution with a demonstrated open gap, not a method paper.
+
+## Second enhancer: the failure is architecture-invariant; the headroom is not
+
+`lisennet_mixed_eval.py`. Every number so far was ConvFSENet's. LiSenNet
+(eco8-neaixt's port of arXiv 2409.13285, 37k params) is a genuinely different
+family — sub-band U-Net with a dual-path recurrent bottleneck, magnitude-only
+mask on the compressed spectrum, noisy-phase reconstruction — yet shares the
+critic's exact feature convention (|X|^0.3, n_fft 512/hop 256) and the RMS
+input normalization, so the whole harness transfers unmodified. The gradient
+loop adapts its decoder output stack: **813 parameters**. Same 150 measured-
+room mixed clips.
+
+| method (LiSenNet, measured rooms) | gain | 95% CI | improved | vs null |
+|---|---:|---:|---:|---:|
+| global preset (null: ~identity, a=1 f=0.1) | +0.000 | — | 44% | — |
+| per-kind preset oracle | +0.031 | ±0.035 | 57% | +0.031 |
+| per-clip grid oracle | +0.102 | ±0.026 | 92% | +0.102* |
+| v1 zeroth-order pick | −0.091 | ±0.027 | 19% | −0.091* |
+| **gradient v1, 10 steps** | **−0.262** | ±0.051 | **9%** | −0.262* |
+| gradient + oracle stop | +0.024 | ±0.011 | 33% | +0.024* |
+
+Per-kind gradient: reverb −0.149, noise **−0.464 (0%)**, tilt −0.297,
+bandlimit −0.135.
+
+Two findings:
+
+**1. The cautionary chain replicates, slightly stronger.** The critic-driven
+loop is harmful on every shift kind for a second architecture (−0.262 overall
+vs ConvFSENet's −0.197), the zeroth-order ranking is again backwards, and
+oracle stopping again cannot rescue it. Combined with the earlier capacity
+sweep this makes the failure invariant across four orders of magnitude of
+adapted parameters: 2 knobs (−0.24), 813 params (−0.26), 49k params (−0.20).
+The failure is a property of the critic, not of the enhancer or the adapted
+subset.
+
+**2. The preset headroom is enhancer-specific.** LiSenNet's best global
+preset is essentially the identity and its per-kind oracle is only +0.031 —
+its shipped masks are already well calibrated under these shifts, where
+ConvFSENet's over-suppressed under reverb (+0.28 preset). The per-clip oracle
+(+0.102*) still exists but is thinner. So the positive opportunity that
+presets exploit is a property of a particular enhancer's miscalibration;
+the negative result about learned-critic gradients is not. For the paper:
+the protocol's nulls are enhancer-dependent and must be re-fit per system —
+one more reason they belong in the evaluation, not the method.
