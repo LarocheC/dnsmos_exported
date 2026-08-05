@@ -1509,3 +1509,31 @@ presets exploit is a property of a particular enhancer's miscalibration;
 the negative result about learned-critic gradients is not. For the paper:
 the protocol's nulls are enhancer-dependent and must be re-fit per system —
 one more reason they belong in the evaluation, not the method.
+
+## Multi-metric scoring: the gradient loop loses on every axis
+
+`multimetric_eval.py` (eco8's official-ONNX DNSMOS wrapper + pystoi). The
+protocol paper criticizes single-metric evaluation, so it cannot itself be
+PESQ-only. Four systems on the measured-room mixed testbed, paired deltas vs
+the shipped baseline, n=150 (* = 95% resolved):
+
+| system | PESQ | STOI | SI-SDR | DNSMOS OVRL | BAK | SIG |
+|---|---:|---:|---:|---:|---:|---:|
+| global preset (train-fit) | +0.018* | +0.003* | −0.206* | +0.008 | −0.075* | +0.046* |
+| router (held-out) | **+0.038*** | +0.002* | −0.122* | **+0.018*** | −0.046* | **+0.050*** |
+| gradient loop | **−0.197*** | **−0.008*** | **−5.699*** | **−0.114*** | **−0.313*** | −0.027 |
+
+* **The gradient loop is negative on every metric**, including the
+  no-reference DNSMOS, which shares no reference, no DSP, and no training
+  data with PESQ. The SI-SDR collapse (−5.7 dB) shows the damage is physical
+  signal corruption, not a PESQ idiosyncrasy. This closes the last escape
+  hatch ("maybe it improves things PESQ can't see") — it does not.
+* **The router's wins generalize beyond PESQ**: resolved-positive vs the
+  shipped baseline on 4 of 6 metrics (PESQ, STOI, DNSMOS OVRL, SIG). Its
+  mechanism is visible in the decomposition: mask softening trades a little
+  suppression (BAK −0.046) for signal preservation (SIG +0.050), netting
+  positive overall quality. (This is vs *baseline*; the held-out PESQ
+  comparison vs the null remains unresolved, as documented above.)
+* Both preset and router cost a little SI-SDR — expected, since softening
+  admits noise — while improving perceptual metrics: a reminder of why
+  SI-SDR alone would mis-rank every system here.
